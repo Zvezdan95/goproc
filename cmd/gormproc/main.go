@@ -1,0 +1,82 @@
+package main
+
+import (
+	"flag"
+	"log"
+	"os"
+	"path/filepath"
+
+	"github.com/user/gormproc/pkg/generator"
+	"github.com/user/gormproc/pkg/parser"
+	"github.com/user/gormproc/pkg/transpiler"
+)
+
+func main() {
+	var dir string
+	var pkg string
+	var out string
+
+	flag.StringVar(&dir, "dir", ".", "Directory containing Go files to parse")
+	flag.StringVar(&pkg, "pkg", "myproject/procedures", "Import path of the procedures package")
+	flag.StringVar(&out, "out", "gen/procedures.go", "Output file for generated code")
+	flag.Parse()
+
+	log.Printf("Parsing directory: %s", dir)
+	procs, err := parser.ParseDir(dir)
+	if err != nil {
+		log.Fatalf("Parse error: %v", err)
+	}
+
+	if len(procs) == 0 {
+		log.Println("No gorm:procedure functions found. Exiting.")
+		return
+	}
+
+	var generated []generator.GeneratedProc
+
+	for _, p := range procs {
+		if err := parser.Validate(p); err != nil {
+			log.Fatalf("Validation error in %s: %v", p.Name, err)
+		}
+
+		pgSQL, err := transpiler.ToPostgres(p, "")
+		if err != nil {
+			log.Fatalf("Transpile to Postgres failed for %s: %v", p.Name, err)
+		}
+
+		mysqlSQL, err := transpiler.ToMySQL(p, "")
+		if err != nil {
+			log.Fatalf("Transpile to MySQL failed for %s: %v", p.Name, err)
+		}
+
+		hash := generator.GenerateHash(p, pgSQL, mysqlSQL)
+
+		// Regenerate with actual hash included in names
+		pgSQL, _ = transpiler.ToPostgres(p, hash)
+		mysqlSQL, _ = transpiler.ToMySQL(p, hash)
+
+		generated = append(generated, generator.GeneratedProc{
+			Proc:     p,
+			Hash:     hash,
+			PgSQL:    pgSQL,
+			MySQLSQL: mysqlSQL,
+		})
+		log.Printf("Successfully transpiled %s (Hash: %s)", p.Name, hash)
+	}
+
+	codeBytes, err := generator.GenerateCode(pkg, generated)
+	if err != nil {
+		log.Fatalf("Code generation failed: %v", err)
+	}
+
+	outDir := filepath.Dir(out)
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		log.Fatalf("Failed to create output directory: %v", err)
+	}
+
+	if err := os.WriteFile(out, codeBytes, 0644); err != nil {
+		log.Fatalf("Failed to write output file: %v", err)
+	}
+
+	log.Printf("Generated code written to %s", out)
+}
