@@ -33,6 +33,7 @@ func GenerateCode(pkgPath string, procs []GeneratedProc) ([]byte, error) {
 	
 	buf.WriteString("import (\n")
 	buf.WriteString("\t\"context\"\n")
+	buf.WriteString("\t_ \"embed\"\n")
 	buf.WriteString("\t\"gorm.io/gorm\"\n")
 	buf.WriteString(fmt.Sprintf("\t\"%s\"\n", pkgPath))
 	buf.WriteString("\t\"github.com/user/gormproc\"\n")
@@ -110,6 +111,15 @@ func GenerateCode(pkgPath string, procs []GeneratedProc) ([]byte, error) {
 		buf.WriteString("}\n\n")
 	}
 
+	for _, p := range procs {
+		baseName := strings.ToLower(p.Proc.Name)
+		fullName := fmt.Sprintf("%s_%s", baseName, p.Hash)
+		buf.WriteString(fmt.Sprintf("//go:embed %s.postgres.sql\n", fullName))
+		buf.WriteString(fmt.Sprintf("var sql_%s_pg string\n\n", fullName))
+		buf.WriteString(fmt.Sprintf("//go:embed %s.mysql.sql\n", fullName))
+		buf.WriteString(fmt.Sprintf("var sql_%s_my string\n\n", fullName))
+	}
+
 	buf.WriteString("var RegisteredProcedures = []gormproc.ProcedureMeta{\n")
 	for _, p := range procs {
 		baseName := strings.ToLower(p.Proc.Name)
@@ -118,8 +128,8 @@ func GenerateCode(pkgPath string, procs []GeneratedProc) ([]byte, error) {
 		buf.WriteString(fmt.Sprintf("\t\tBaseName: \"%s\",\n", baseName))
 		buf.WriteString(fmt.Sprintf("\t\tHash: \"%s\",\n", p.Hash))
 		buf.WriteString(fmt.Sprintf("\t\tFullName: \"%s\",\n", fullName))
-		buf.WriteString(fmt.Sprintf("\t\tPostgresSQL: `%s`,\n", p.PgSQL))
-		buf.WriteString(fmt.Sprintf("\t\tMySQLSQL: `%s`,\n", p.MySQLSQL))
+		buf.WriteString(fmt.Sprintf("\t\tPostgresSQL: sql_%s_pg,\n", fullName))
+		buf.WriteString(fmt.Sprintf("\t\tMySQLSQL: sql_%s_my,\n", fullName))
 		buf.WriteString("\t},\n")
 	}
 	buf.WriteString("}\n")

@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"fmt"
 
 	"github.com/user/gormproc/pkg/generator"
 	"github.com/user/gormproc/pkg/parser"
@@ -72,6 +74,22 @@ func main() {
 	outDir := filepath.Dir(out)
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		log.Fatalf("Failed to create output directory: %v", err)
+	}
+	
+	// Write out the separate SQL files
+	for _, p := range generated {
+		baseName := strings.ToLower(p.Proc.Name)
+		fullName := fmt.Sprintf("%s_%s", baseName, p.Hash)
+		
+		pgFile := filepath.Join(outDir, fullName+".postgres.sql")
+		if err := os.WriteFile(pgFile, []byte(p.PgSQL), 0644); err != nil {
+			log.Fatalf("Failed to write postgres sql: %v", err)
+		}
+		
+		myFile := filepath.Join(outDir, fullName+".mysql.sql")
+		if err := os.WriteFile(myFile, []byte(p.MySQLSQL), 0644); err != nil {
+			log.Fatalf("Failed to write mysql sql: %v", err)
+		}
 	}
 
 	if err := os.WriteFile(out, codeBytes, 0644); err != nil {
