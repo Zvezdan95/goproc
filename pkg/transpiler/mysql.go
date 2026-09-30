@@ -47,12 +47,18 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 	
 	var extractArg func(expr ast.Expr) string
 	extractArg = func(expr ast.Expr) string {
+		if expr == nil {
+			return "''"
+		}
 		switch e := expr.(type) {
 		case *ast.Ident:
+			if e.Name == "nil" { return "NULL" }
+			if e.Name == "true" { return "1" }
+			if e.Name == "false" { return "0" }
 			if strings.HasPrefix(e.Name, "cConst_") || strings.HasPrefix(e.Name, "eError_") {
 				return e.Name
 			}
-			if e.Name == "i" || e.Name == "m_i" || e.Name == "m_i2" {
+			if e.Name == "i" || e.Name == "m_i" || e.Name == "m_i2" || e.Name == "val" || e.Name == "absAmt" || e.Name == "fee" || e.Name == "jpCont" || e.Name == "mappedType" || e.Name == "amtNeg" || e.Name == "extAmount1" || e.Name == "extAmount2" || strings.HasPrefix(e.Name, "p_ext") {
 				return "v_" + e.Name
 			}
 			if strings.HasPrefix(e.Name, "i_") {
@@ -68,17 +74,60 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 			}
 			return e.Value
 		case *ast.UnaryExpr:
+			if e.Op == token.SUB {
+				return "-" + extractArg(e.X)
+			}
+			if e.Op == token.NOT {
+				return "NOT " + extractArg(e.X)
+			}
+			if e.Op == token.AND {
+				return extractArg(e.X)
+			}
 			return extractArg(e.X)
+		case *ast.StarExpr:
+			return extractArg(e.X)
+		case *ast.BinaryExpr:
+			op := e.Op.String()
+			if op == "==" { op = "=" }
+			if op == "&&" { op = "AND" }
+			if op == "||" { op = "OR" }
+			x := extractArg(e.X)
+			y := extractArg(e.Y)
+			if y == "NULL" {
+				if op == "=" { return x + " IS NULL" }
+				if op == "!=" { return x + " IS NOT NULL" }
+			}
+			return x + " " + op + " " + y
+		case *ast.ParenExpr:
+			return "(" + extractArg(e.X) + ")"
 		case *ast.CallExpr:
 			if sel, ok := e.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Sprintf" {
 				if len(e.Args) >= 2 {
 					if lit, ok := e.Args[0].(*ast.BasicLit); ok {
 						format := strings.Trim(lit.Value, "\"")
-						// Very basic Sprintf to CONCAT
 						parts := strings.Split(format, "%d")
 						if len(parts) == 2 {
-							return fmt.Sprintf("CONCAT('%s', %s, '%s')", parts[0], extractArg(e.Args[1]), parts[1])
+							return "CONCAT('" + parts[0] + "', " + extractArg(e.Args[1]) + ", '" + parts[1] + "')"
 						}
+					}
+				}
+			}
+			if sel, ok := e.Fun.(*ast.SelectorExpr); ok {
+				if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name == "gormproc" {
+					if sel.Sel.Name == "JSONExtractFloat64" || sel.Sel.Name == "JSONExtractString" {
+						return "JSON_UNQUOTE(JSON_EXTRACT(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + "))"
+					}
+					if sel.Sel.Name == "CasinogameFeeCurrent" {
+						return "pokermem.Casinogame_fee_current(" + extractArg(e.Args[0]) + ")"
+					}
+					if sel.Sel.Name == "CasinogameCalcJackpotContribution" {
+						return "casinodb.Casinogame_calc_jackpotContribution(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
+					}
+					if sel.Sel.Name == "JSONOverlaps" {
+						return "JSON_OVERLAPS(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
+					}
+					if sel.Sel.Name == "GlobHasBits" {
+						return "pokermem.GlobHasBits(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
 					}
 				}
 			}
@@ -194,15 +243,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 				}
 			}
 			
-			buf.WriteString("WHILE ")
-			if bin, ok := s.Cond.(*ast.BinaryExpr); ok {
-				x := extractArg(bin.X)
-				y := extractArg(bin.Y)
-				op := bin.Op.String()
-				buf.WriteString(fmt.Sprintf("%s %s %s", x, op, y))
-			} else {
-				buf.WriteString("1=1")
-			}
+			buf.WriteString("WHILE " + extractArg(s.Cond))
 			buf.WriteString(" DO\n")
 			
 			walkStmt(s.Body)
@@ -283,42 +324,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 				}
 			}
 
-			buf.WriteString("IF ")
-			if bin, ok := s.Cond.(*ast.BinaryExpr); ok {
-				x := extractArg(bin.X)
-				y := extractArg(bin.Y)
-				
-				if y == "\"\"" {
-					if bin.Op == token.EQL {
-						buf.WriteString(fmt.Sprintf("%s IS NULL OR %s = ''", x, x))
-					} else {
-						buf.WriteString(fmt.Sprintf("%s IS NOT NULL AND %s != ''", x, x))
-					}
-				} else {
-					var op string
-					if bin.Op == token.LEQ { op = "<=" }
-					if bin.Op == token.LSS { op = "<" }
-					if bin.Op == token.GTR { op = ">" }
-					if bin.Op == token.GEQ { op = ">=" }
-					if bin.Op == token.EQL { op = "=" }
-					if bin.Op == token.NEQ { op = "!=" }
-					buf.WriteString(fmt.Sprintf("%s %s %s", x, op, y))
-				}
-			} else if call, ok := s.Cond.(*ast.CallExpr); ok {
-				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "JSONOverlaps" {
-					arg1 := extractArg(call.Args[0])
-					arg2 := extractArg(call.Args[1])
-					buf.WriteString(fmt.Sprintf("JSON_OVERLAPS(%s, %s)", arg1, arg2))
-				} else if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "GlobHasBits" {
-					arg1 := extractArg(call.Args[0])
-					arg2 := extractArg(call.Args[1])
-					buf.WriteString(fmt.Sprintf("pokermem.GlobHasBits(%s, %s)", arg1, arg2))
-				} else {
-					buf.WriteString("1=1")
-				}
-			} else {
-				buf.WriteString("1=1")
-			}
+			buf.WriteString("IF " + extractArg(s.Cond))
 			
 			buf.WriteString(" THEN\n")
 			walkStmt(s.Body)
@@ -430,5 +436,39 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 	})
 
 	buf.WriteString("END;")
-	return buf.String(), nil
+	return formatSQL(buf.String()), nil
+}
+
+func formatSQL(sql string) string {
+	lines := strings.Split(sql, "\n")
+	var formatted []string
+	indent := 0
+	
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		
+		outdentNow := false
+		if strings.HasPrefix(trimmed, "END") || trimmed == "ELSE" || strings.HasPrefix(trimmed, "WHEN ") || strings.HasPrefix(trimmed, "ELSEIF ") {
+			outdentNow = true
+		}
+		
+		currentIndent := indent
+		if outdentNow {
+			currentIndent--
+			if currentIndent < 0 { currentIndent = 0 }
+		}
+		
+		formatted = append(formatted, strings.Repeat("\t", currentIndent) + trimmed)
+		
+		if strings.HasPrefix(trimmed, "BEGIN") || strings.HasPrefix(trimmed, "IF ") || strings.HasPrefix(trimmed, "WHILE ") || strings.HasPrefix(trimmed, "CASE ") || trimmed == "ELSE" || strings.HasPrefix(trimmed, "WHEN ") || strings.HasPrefix(trimmed, "ELSEIF ") {
+			indent = currentIndent + 1
+		}
+        if strings.HasPrefix(trimmed, "END") {
+            indent = currentIndent
+        }
+	}
+	return strings.Join(formatted, "\n")
 }
