@@ -10,108 +10,6 @@ import (
 	"github.com/user/gormproc/pkg/parser"
 )
 
-func findTopLevelFrom(query string) int {
-	depth := 0
-	inQuote := false
-	var quoteChar byte
-	upper := strings.ToUpper(query)
-	for i := 0; i < len(query); i++ {
-		c := query[i]
-		if inQuote {
-			if c == quoteChar {
-				inQuote = false
-			}
-			continue
-		}
-		if c == '\'' || c == '"' || c == '`' {
-			inQuote = true
-			quoteChar = c
-			continue
-		}
-		if c == '(' {
-			depth++
-			continue
-		}
-		if c == ')' {
-			if depth > 0 {
-				depth--
-			}
-			continue
-		}
-		if depth == 0 && i+6 <= len(upper) {
-			if upper[i:i+6] == " FROM " {
-				return i
-			}
-		}
-	}
-	return -1
-}
-
-func formatToConcat(format string, args []string) string {
-	var parts []string
-	argIdx := 0
-	last := 0
-	i := 0
-	for i < len(format) {
-		if format[i] == '%' && i+1 < len(format) {
-			spec := format[i+1]
-			if spec == 'd' || spec == 's' || spec == 'v' || spec == 'f' {
-				if i > last {
-					parts = append(parts, "'"+format[last:i]+"'")
-				}
-				if argIdx < len(args) {
-					parts = append(parts, args[argIdx])
-					argIdx++
-				}
-				i += 2
-				last = i
-				continue
-			}
-		}
-		i++
-	}
-	if last < len(format) {
-		parts = append(parts, "'"+format[last:]+"'")
-	}
-	if len(parts) == 0 {
-		return "''"
-	}
-	if len(parts) == 1 {
-		return parts[0]
-	}
-	return "CONCAT(" + strings.Join(parts, ", ") + ")"
-}
-
-func isErrCheck(expr ast.Expr) bool {
-	if bin, ok := expr.(*ast.BinaryExpr); ok {
-		if bin.Op == token.NEQ {
-			if id, ok := bin.X.(*ast.Ident); ok && id.Name == "err" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isBoilerplateErrorReturn(stmt ast.Stmt) bool {
-	if stmt == nil {
-		return true
-	}
-	if ret, ok := stmt.(*ast.ReturnStmt); ok {
-		if len(ret.Results) == 1 {
-			if id, ok := ret.Results[0].(*ast.Ident); ok && id.Name == "err" {
-				return true
-			}
-		}
-	}
-	if block, ok := stmt.(*ast.BlockStmt); ok {
-		if len(block.List) == 1 {
-			return isBoilerplateErrorReturn(block.List[0])
-		}
-	}
-	return false
-}
-
 func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 	var bodyBuf bytes.Buffer
 	var declsBuf bytes.Buffer
@@ -172,7 +70,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		}
 		switch e := expr.(type) {
 		case *ast.Ident:
-			if e.Name == "nil" {
+			if e.Name == "nil" || e.Name == "err" {
 				return "NULL"
 			}
 			if e.Name == "true" {
@@ -363,7 +261,11 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		declaredVars[name] = true
 		localVarMap[name] = true
 
-		typ := "VARCHAR(255)"
+		if star, ok := typeNode.(*ast.StarExpr); ok {
+			typeNode = star.X
+		}
+
+		typ := ""
 		if id, ok := typeNode.(*ast.Ident); ok {
 			switch id.Name {
 			case "int64", "uint64", "uint32", "uint":
@@ -380,16 +282,17 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 				typ = "BOOLEAN"
 			case "string":
 				typ = "TEXT"
-			default:
-				return
 			}
-		} else {
-			return
+		}
+		if typ == "" {
+			typ = inferTypeFromExpr(valExpr, name, "mysql")
 		}
 
 		def := ""
 		if valExpr != nil {
-			def = " DEFAULT " + extractArg(valExpr)
+			if _, ok := valExpr.(*ast.BasicLit); ok {
+				def = " DEFAULT " + extractArg(valExpr)
+			}
 		}
 		declsBuf.WriteString(fmt.Sprintf("DECLARE v_%s %s%s;\n", name, typ, def))
 	}
@@ -443,6 +346,16 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 						for _, name := range vSpec.Names {
 							declareVar(name.Name, vSpec.Type, val)
 						}
+					}
+				}
+			} else if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE {
+				for i, lhs := range assign.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok {
+						var rhs ast.Expr
+						if i < len(assign.Rhs) {
+							rhs = assign.Rhs[i]
+						}
+						declareVar(id.Name, nil, rhs)
 					}
 				}
 			}
@@ -519,7 +432,11 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 							resFields = append(resFields, fieldName)
 						}
 						if !declaredVars[fieldName] {
-							declareVar(fieldName, &ast.Ident{Name: "string"}, nil)
+							var rhs ast.Expr
+							if len(s.Rhs) > 0 {
+								rhs = s.Rhs[0]
+							}
+							declareVar(fieldName, nil, rhs)
 						}
 					}
 				}
@@ -690,7 +607,13 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 				return
 			}
 
-			bodyBuf.WriteString("IF " + extractArg(s.Cond))
+			cond := cleanErrCondition(s.Cond)
+			if id, ok := cond.(*ast.Ident); ok && strings.EqualFold(id.Name, "TRUE") {
+				walkStmt(s.Body)
+				return
+			}
+
+			bodyBuf.WriteString("IF " + extractArg(cond))
 			bodyBuf.WriteString(" THEN\n")
 			walkStmt(s.Body)
 
@@ -715,7 +638,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 									resFields = append(resFields, fieldName)
 								}
 								if !declaredVars[fieldName] {
-									declareVar(fieldName, &ast.Ident{Name: "string"}, nil)
+									declareVar(fieldName, nil, kv.Value)
 								}
 								val := extractArg(kv.Value)
 								bodyBuf.WriteString(fmt.Sprintf("SET v_%s = %s;\n", fieldName, val))

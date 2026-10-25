@@ -66,6 +66,16 @@ func AnalyzeCallGraph(proc *parser.Procedure) (*CallGraphAnalyzer, error) {
 					}
 				}
 			}
+		case *ast.AssignStmt:
+			if node.Tok.String() == ":=" {
+				for _, lhs := range node.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok {
+						if id.Name != "_" && id.Name != "err" && id.Name != "res" {
+							analyzer.LocalVars = append(analyzer.LocalVars, id.Name)
+						}
+					}
+				}
+			}
 		}
 		return true
 	})

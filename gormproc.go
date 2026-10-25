@@ -81,20 +81,34 @@ func AutoMigrate(db *gorm.DB, procs ...ProcedureMeta) error {
 			return fmt.Errorf("missing SQL statement for dialect %s in procedure %s", dialect, proc.BaseName)
 		}
 
-		err = db.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Exec(stmt).Error; err != nil {
+		if dialect == "mysql" {
+			// MySQL DDL (CREATE/DROP PROCEDURE) causes an implicit commit in the storage engine.
+			// Executing non-transactionally avoids implicit transaction commit errors.
+			_ = db.Exec(fmt.Sprintf("DROP PROCEDURE IF EXISTS %s", proc.FullName))
+			if err := db.Exec(stmt).Error; err != nil {
 				return fmt.Errorf("failed to execute CREATE PROCEDURE for %s: %w", proc.FullName, err)
 			}
-
-			// Record the migration
-			if err := tx.Exec("INSERT INTO gorm_procedure_registry (base_name, hash, full_name, dialect) VALUES (?, ?, ?, ?)", proc.BaseName, proc.Hash, proc.FullName, dialect).Error; err != nil {
+			if err := db.Exec("INSERT INTO gorm_procedure_registry (base_name, hash, full_name, dialect) VALUES (?, ?, ?, ?)", proc.BaseName, proc.Hash, proc.FullName, dialect).Error; err != nil {
 				return fmt.Errorf("failed to update registry for %s: %w", proc.FullName, err)
 			}
-			return nil
-		})
+		} else {
+			err = db.Transaction(func(tx *gorm.DB) error {
+				if dialect == "postgres" {
+					_ = tx.Exec(fmt.Sprintf("DROP PROCEDURE IF EXISTS %s", proc.FullName))
+				}
+				if err := tx.Exec(stmt).Error; err != nil {
+					return fmt.Errorf("failed to execute CREATE PROCEDURE for %s: %w", proc.FullName, err)
+				}
 
-		if err != nil {
-			return err
+				// Record the migration
+				if err := tx.Exec("INSERT INTO gorm_procedure_registry (base_name, hash, full_name, dialect) VALUES (?, ?, ?, ?)", proc.BaseName, proc.Hash, proc.FullName, dialect).Error; err != nil {
+					return fmt.Errorf("failed to update registry for %s: %w", proc.FullName, err)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
 		}
 	}
 

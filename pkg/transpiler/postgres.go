@@ -70,7 +70,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 		}
 		switch e := expr.(type) {
 		case *ast.Ident:
-			if e.Name == "nil" {
+			if e.Name == "nil" || e.Name == "err" {
 				return "NULL"
 			}
 			if e.Name == "true" {
@@ -260,7 +260,11 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 		declaredVars[name] = true
 		localVarMap[name] = true
 
-		typ := "VARCHAR"
+		if star, ok := typeNode.(*ast.StarExpr); ok {
+			typeNode = star.X
+		}
+
+		typ := ""
 		if id, ok := typeNode.(*ast.Ident); ok {
 			switch id.Name {
 			case "int64", "uint64", "uint32", "uint":
@@ -277,16 +281,17 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 				typ = "BOOLEAN"
 			case "string":
 				typ = "TEXT"
-			default:
-				return
 			}
-		} else {
-			return
+		}
+		if typ == "" {
+			typ = inferTypeFromExpr(valExpr, name, "postgres")
 		}
 
 		def := ""
 		if valExpr != nil {
-			def = " := " + extractArg(valExpr)
+			if _, ok := valExpr.(*ast.BasicLit); ok {
+				def = " := " + extractArg(valExpr)
+			}
 		}
 		varDecls.WriteString(fmt.Sprintf("\t%s %s%s;\n", "v_"+name, typ, def))
 	}
@@ -340,6 +345,16 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 						for _, name := range vSpec.Names {
 							declareVar(name.Name, vSpec.Type, val)
 						}
+					}
+				}
+			} else if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE {
+				for i, lhs := range assign.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok {
+						var rhs ast.Expr
+						if i < len(assign.Rhs) {
+							rhs = assign.Rhs[i]
+						}
+						declareVar(id.Name, nil, rhs)
 					}
 				}
 			}
@@ -416,7 +431,11 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 							resFields = append(resFields, fieldName)
 						}
 						if !declaredVars[fieldName] {
-							declareVar(fieldName, &ast.Ident{Name: "string"}, nil)
+							var rhs ast.Expr
+							if len(s.Rhs) > 0 {
+								rhs = s.Rhs[0]
+							}
+							declareVar(fieldName, nil, rhs)
 						}
 					}
 				}
@@ -586,7 +605,13 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 				return
 			}
 
-			bodyBuf.WriteString("IF " + extractArg(s.Cond))
+			cond := cleanErrCondition(s.Cond)
+			if id, ok := cond.(*ast.Ident); ok && strings.EqualFold(id.Name, "TRUE") {
+				walkStmt(s.Body)
+				return
+			}
+
+			bodyBuf.WriteString("IF " + extractArg(cond))
 			bodyBuf.WriteString(" THEN\n")
 			walkStmt(s.Body)
 
@@ -611,7 +636,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 									resFields = append(resFields, fieldName)
 								}
 								if !declaredVars[fieldName] {
-									declareVar(fieldName, &ast.Ident{Name: "string"}, nil)
+									declareVar(fieldName, nil, kv.Value)
 								}
 								val := extractArg(kv.Value)
 								bodyBuf.WriteString(fmt.Sprintf("v_%s := %s;\n", fieldName, val))

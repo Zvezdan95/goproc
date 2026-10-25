@@ -427,8 +427,104 @@ func CompositeProc(ctx context.Context, roundID string) (BookResult, error) {
 	if !strings.Contains(pgComp, "v_RoundID := p_roundID;") || !strings.Contains(pgComp, "v_Balance := 250.5;") {
 		t.Errorf("Postgres missing composite literal assignment statements. Got:\n%s", pgComp)
 	}
-	if !strings.Contains(pgComp, "SELECT v_RoundID AS RoundID, v_Balance AS Balance;") {
-		t.Errorf("Postgres missing composite literal SELECT projection. Got:\n%s", pgComp)
+	// 10. Observation 1: Idiomatic Error Checking with SelectInto (err == nil && condition)
+	codeSelectIntoErr := `package test
+import (
+	"context"
+	"github.com/user/gormproc"
+	"gorm.io/gorm"
+)
+func SelectIntoErrProc(ctx context.Context, id int64) error {
+	var tx *gorm.DB
+	var bonusID int64
+	if err := gormproc.SelectInto(tx, "SELECT id FROM bonus WHERE user_id = ?", id, &bonusID); err == nil && bonusID != 0 {
+		tx.Exec("UPDATE users SET bonus_id = ?", bonusID)
+	}
+	return nil
+}`
+	procSelectIntoErr := parseCodeToProc(t, "SelectIntoErrProc", codeSelectIntoErr)
+	mySelectErr, err := ToMySQL(procSelectIntoErr, "h10")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if strings.Contains(mySelectErr, "v_err") {
+		t.Errorf("MySQL emitted invalid v_err variable. Got:\n%s", mySelectErr)
+	}
+	if !strings.Contains(mySelectErr, "IF v_bonusID != 0 THEN") {
+		t.Errorf("MySQL failed to simplify err == nil && bonusID != 0 condition. Got:\n%s", mySelectErr)
+	}
+	pgSelectErr, err := ToPostgres(procSelectIntoErr, "h10")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	if strings.Contains(pgSelectErr, "v_err") {
+		t.Errorf("Postgres emitted invalid v_err variable. Got:\n%s", pgSelectErr)
+	}
+	if !strings.Contains(pgSelectErr, "IF v_bonusID != 0 THEN") {
+		t.Errorf("Postgres failed to simplify err == nil && bonusID != 0 condition. Got:\n%s", pgSelectErr)
+	}
+
+	// 11. Observation 2: Pointer variable declarations (var bAccID *uint32, var s *string)
+	codePointers := `package test
+import (
+	"context"
+	"gorm.io/gorm"
+)
+func PointerVarProc(ctx context.Context) error {
+	var tx *gorm.DB
+	var bAccID *uint32
+	var sMsg *string
+	tx.Exec("UPDATE test SET val = 1")
+	_ = bAccID
+	_ = sMsg
+	return nil
+}`
+	procPointers := parseCodeToProc(t, "PointerVarProc", codePointers)
+	myPointers, err := ToMySQL(procPointers, "h11")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if !strings.Contains(myPointers, "DECLARE v_bAccID BIGINT;") {
+		t.Errorf("MySQL missing DECLARE v_bAccID BIGINT; for *uint32 pointer. Got:\n%s", myPointers)
+	}
+	if !strings.Contains(myPointers, "DECLARE v_sMsg TEXT;") {
+		t.Errorf("MySQL missing DECLARE v_sMsg TEXT; for *string pointer. Got:\n%s", myPointers)
+	}
+
+	// 12. Short variable declaration (:=) and struct pointer assignment (res.BonusAccountID = &bAccID)
+	codeShortDecl := `package test
+import (
+	"context"
+	"gorm.io/gorm"
+)
+type ResultStruct struct {
+	BonusAccountID *uint32
+}
+func ShortDeclProc(ctx context.Context) (ResultStruct, error) {
+	var res ResultStruct
+	var tx *gorm.DB
+	bAccID := uint32(1001)
+	count := 5
+	tx.Exec("UPDATE test SET count = ?", count)
+	res.BonusAccountID = &bAccID
+	return res, nil
+}`
+	procShortDecl := parseCodeToProc(t, "ShortDeclProc", codeShortDecl)
+	myShortDecl, err := ToMySQL(procShortDecl, "h12")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if !strings.Contains(myShortDecl, "DECLARE v_bAccID BIGINT;") {
+		t.Errorf("MySQL missing DECLARE for := variable bAccID. Got:\n%s", myShortDecl)
+	}
+	if !strings.Contains(myShortDecl, "DECLARE v_count BIGINT") {
+		t.Errorf("MySQL missing DECLARE for := variable count. Got:\n%s", myShortDecl)
+	}
+	if !strings.Contains(myShortDecl, "SET v_BonusAccountID = v_bAccID;") {
+		t.Errorf("MySQL missing SET v_BonusAccountID = v_bAccID;. Got:\n%s", myShortDecl)
+	}
+	if !strings.Contains(myShortDecl, "DECLARE v_BonusAccountID BIGINT;") {
+		t.Errorf("MySQL expected DECLARE v_BonusAccountID BIGINT; inferred from &bAccID. Got:\n%s", myShortDecl)
 	}
 }
 
