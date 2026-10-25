@@ -352,5 +352,84 @@ func (s *BookService) Book(ctx context.Context, roundID string) (BookResult, err
 	if !strings.Contains(pgRes, "SELECT v_RoundID AS RoundID;") {
 		t.Errorf("Postgres missing result projection SELECT v_RoundID AS RoundID. Got:\n%s", pgRes)
 	}
+
+	// 8. Inlined function calls in binary expressions (e.g. if gormproc.JSONLength(...) == 1)
+	codeInlined := `package test
+import (
+	"context"
+	"github.com/user/gormproc"
+)
+func InlinedProc(ctx context.Context, m_book string, m_flags uint64) {
+	if gormproc.JSONLength(m_book, "$") == 1 {
+		_ = m_book
+	}
+	if pokermem.GlobHasBits(m_flags, 16) != 0 {
+		_ = m_flags
+	}
+}`
+	procInlined := parseCodeToProc(t, "InlinedProc", codeInlined)
+	myInlined, err := ToMySQL(procInlined, "h8")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if !strings.Contains(myInlined, "IF JSON_LENGTH(p_m_book, \"$\") = 1 THEN") {
+		t.Errorf("MySQL inlined JSONLength failed. Got:\n%s", myInlined)
+	}
+	if !strings.Contains(myInlined, "IF pokermem.GlobHasBits(p_m_flags, 16) != 0 THEN") {
+		t.Errorf("MySQL inlined GlobHasBits failed. Got:\n%s", myInlined)
+	}
+	pgInlined, err := ToPostgres(procInlined, "h8")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	if !strings.Contains(pgInlined, "IF jsonb_array_length((p_m_book)::jsonb) = 1 THEN") {
+		t.Errorf("Postgres inlined JSONLength failed. Got:\n%s", pgInlined)
+	}
+	if !strings.Contains(pgInlined, "IF pokermem.GlobHasBits(p_m_flags, 16) != 0 THEN") {
+		t.Errorf("Postgres inlined GlobHasBits failed. Got:\n%s", pgInlined)
+	}
+
+	// 9. Composite literal struct assignment (res = BookResult{...})
+	codeComposite := `package test
+import (
+	"context"
+	"gorm.io/gorm"
+)
+type BookResult struct {
+	RoundID string
+	Balance float64
 }
+func CompositeProc(ctx context.Context, roundID string) (BookResult, error) {
+	var res BookResult
+	var tx *gorm.DB
+	tx.Exec("UPDATE rounds SET id = ?", roundID)
+	res = BookResult{
+		RoundID: roundID,
+		Balance: 250.5,
+	}
+	return res, nil
+}`
+	procComposite := parseCodeToProc(t, "CompositeProc", codeComposite)
+	myComp, err := ToMySQL(procComposite, "h9")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if !strings.Contains(myComp, "SET v_RoundID = p_roundID;") || !strings.Contains(myComp, "SET v_Balance = 250.5;") {
+		t.Errorf("MySQL missing composite literal SET statements. Got:\n%s", myComp)
+	}
+	if !strings.Contains(myComp, "SELECT v_RoundID AS RoundID, v_Balance AS Balance;") {
+		t.Errorf("MySQL missing composite literal SELECT projection. Got:\n%s", myComp)
+	}
+	pgComp, err := ToPostgres(procComposite, "h9")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	if !strings.Contains(pgComp, "v_RoundID := p_roundID;") || !strings.Contains(pgComp, "v_Balance := 250.5;") {
+		t.Errorf("Postgres missing composite literal assignment statements. Got:\n%s", pgComp)
+	}
+	if !strings.Contains(pgComp, "SELECT v_RoundID AS RoundID, v_Balance AS Balance;") {
+		t.Errorf("Postgres missing composite literal SELECT projection. Got:\n%s", pgComp)
+	}
+}
+
 

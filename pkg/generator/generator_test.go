@@ -71,3 +71,53 @@ func SimpleProc(ctx context.Context, id int64) error { return nil }
 		t.Errorf("Expected return err missing. Got:\n%s", str)
 	}
 }
+
+func TestGenerateMultiResultSetCode(t *testing.T) {
+	code := `package test
+import "context"
+type Res1 struct { ID int64 }
+type Res2 struct { Name string }
+func MultiProc(ctx context.Context, id int64) (Res1, Res2, error) { return Res1{}, Res2{}, nil }
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "test.go", code, 0)
+	if err != nil {
+		t.Fatalf("ParseFile failed: %v", err)
+	}
+
+	fn := file.Decls[len(file.Decls)-1].(*ast.FuncDecl)
+	proc := &coreParser.Procedure{
+		Name: "MultiProc",
+		Func: fn,
+		Pkg:  &packages.Package{Fset: fset},
+	}
+
+	genProcs := []GeneratedProc{
+		{
+			Proc:     proc,
+			Hash:     "87654321",
+			PgSQL:    "SELECT 1;",
+			MySQLSQL: "SELECT 1;",
+		},
+	}
+
+	src, err := GenerateCode("github.com/user/gormproc/example/procedures", genProcs)
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+
+	str := string(src)
+	if !strings.Contains(str, "MultiProc(ctx context.Context, id int64) (procedures.Res1, procedures.Res2, error)") {
+		t.Errorf("Expected multi-result signature missing. Got:\n%s", str)
+	}
+	if !strings.Contains(str, "rows, err := p.db.WithContext(ctx).Raw(\"CALL multiproc_87654321(?)\", id).Rows()") {
+		t.Errorf("Expected Rows call missing. Got:\n%s", str)
+	}
+	if !strings.Contains(str, "rows.NextResultSet()") {
+		t.Errorf("Expected rows.NextResultSet() missing. Got:\n%s", str)
+	}
+	if !strings.Contains(str, "return result1, result2, err") {
+		t.Errorf("Expected multi-result return missing. Got:\n%s", str)
+	}
+}
+

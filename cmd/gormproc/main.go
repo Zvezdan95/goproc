@@ -19,7 +19,7 @@ func main() {
 	var out string
 
 	flag.StringVar(&dir, "dir", ".", "Directory containing Go files to parse")
-	flag.StringVar(&pkg, "pkg", "github.com/user/gormproc/example/procedures", "Import path of the procedures package")
+	flag.StringVar(&pkg, "pkg", "", "Import path of the procedures package (auto-detected if omitted)")
 	flag.StringVar(&out, "out", "gen/procedures.go", "Output file for generated code")
 	flag.Parse()
 
@@ -32,6 +32,13 @@ func main() {
 	if len(procs) == 0 {
 		log.Println("No gorm:procedure functions found. Exiting.")
 		return
+	}
+
+	if pkg == "" && procs[0].Pkg != nil && procs[0].Pkg.PkgPath != "" {
+		pkg = procs[0].Pkg.PkgPath
+	}
+	if pkg == "" {
+		pkg = "github.com/user/gormproc/example/procedures"
 	}
 
 	var generated []generator.GeneratedProc

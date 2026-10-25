@@ -143,19 +143,30 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 					return x + " IS NOT NULL"
 				}
 			}
+			if x == "NULL" {
+				if op == "=" {
+					return y + " IS NULL"
+				}
+				if op == "!=" {
+					return y + " IS NOT NULL"
+				}
+			}
 			return x + " " + op + " " + y
 		case *ast.ParenExpr:
 			return "(" + extractArg(e.X) + ")"
 		case *ast.CallExpr:
 			// 1. Go type cast
+			castTypes := map[string]bool{
+				"int": true, "int8": true, "int16": true, "int32": true, "int64": true,
+				"uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
+				"float32": true, "float64": true, "byte": true, "rune": true, "string": true,
+			}
 			if funId, ok := e.Fun.(*ast.Ident); ok {
-				castTypes := map[string]bool{
-					"int": true, "int8": true, "int16": true, "int32": true, "int64": true,
-					"uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
-					"float32": true, "float64": true, "byte": true, "rune": true, "string": true,
-				}
 				if castTypes[funId.Name] && len(e.Args) == 1 {
 					return extractArg(e.Args[0])
+				}
+				if funId.Name == "len" && len(e.Args) == 1 {
+					return "LENGTH(" + extractArg(e.Args[0]) + ")"
 				}
 			}
 
@@ -179,6 +190,9 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 					if sel.Sel.Name == "JSONExtractFloat64" || sel.Sel.Name == "JSONExtractString" {
 						return "(" + extractArg(e.Args[0]) + " ->> " + extractArg(e.Args[1]) + ")"
 					}
+					if sel.Sel.Name == "JSONLength" {
+						return "jsonb_array_length((" + extractArg(e.Args[0]) + ")::jsonb)"
+					}
 					if sel.Sel.Name == "LastInsertID" {
 						return "LASTVAL()"
 					}
@@ -194,7 +208,45 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 					if sel.Sel.Name == "GlobHasBits" {
 						return "pokermem.GlobHasBits(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
 					}
+					if sel.Sel.Name == "FromJsonString" {
+						return "pokermem.FromJson_string(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
+					}
+					if sel.Sel.Name == "FromJsonStringOptional" {
+						return "pokermem.FromJson_string_optional(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
+					}
+					if sel.Sel.Name == "FromJsonInt64Optional" {
+						return "pokermem.FromJson_int64_optional(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
+					}
+					if sel.Sel.Name == "FromJsonArray" {
+						return "pokermem.FromJson_array(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
+					}
+					if sel.Sel.Name == "FromJsonInt64" {
+						return "pokermem.FromJson_int64(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
+					}
+				} else if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name != "fmt" {
+					var argStrs []string
+					for _, arg := range e.Args {
+						if id, ok := arg.(*ast.Ident); ok && id.Name == "ctx" {
+							continue
+						}
+						argStrs = append(argStrs, extractArg(arg))
+					}
+					if pkgId.Name == "s" || pkgId.Name == "b" {
+						return fmt.Sprintf("%s(%s)", strings.ToLower(sel.Sel.Name), strings.Join(argStrs, ", "))
+					}
+					return fmt.Sprintf("%s.%s(%s)", pkgId.Name, sel.Sel.Name, strings.Join(argStrs, ", "))
 				}
+			}
+
+			if funId, ok := e.Fun.(*ast.Ident); ok && !castTypes[funId.Name] && funId.Name != "len" {
+				var argStrs []string
+				for _, arg := range e.Args {
+					if id, ok := arg.(*ast.Ident); ok && id.Name == "ctx" {
+						continue
+					}
+					argStrs = append(argStrs, extractArg(arg))
+				}
+				return fmt.Sprintf("%s(%s)", funId.Name, strings.Join(argStrs, ", "))
 			}
 		}
 		return "''"
@@ -329,6 +381,27 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 			var lhs string
 			if len(s.Lhs) > 0 {
 				if id, ok := s.Lhs[0].(*ast.Ident); ok {
+					if id.Name == "res" && len(s.Rhs) > 0 {
+						if comp, ok := s.Rhs[0].(*ast.CompositeLit); ok {
+							for _, elt := range comp.Elts {
+								if kv, ok := elt.(*ast.KeyValueExpr); ok {
+									if keyId, ok := kv.Key.(*ast.Ident); ok {
+										fieldName := keyId.Name
+										if !resFieldSet[fieldName] {
+											resFieldSet[fieldName] = true
+											resFields = append(resFields, fieldName)
+										}
+										if !declaredVars[fieldName] {
+											declareVar(fieldName, &ast.Ident{Name: "string"}, nil)
+										}
+										val := extractArg(kv.Value)
+										bodyBuf.WriteString(fmt.Sprintf("v_%s := %s;\n", fieldName, val))
+									}
+								}
+							}
+							return
+						}
+					}
 					if s.Tok == token.DEFINE {
 						localVarMap[id.Name] = true
 					}
@@ -526,6 +599,25 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 		case *ast.ReturnStmt:
 			for _, res := range s.Results {
 				if emitQuery(res) {
+					continue
+				}
+				if comp, ok := res.(*ast.CompositeLit); ok {
+					for _, elt := range comp.Elts {
+						if kv, ok := elt.(*ast.KeyValueExpr); ok {
+							if keyId, ok := kv.Key.(*ast.Ident); ok {
+								fieldName := keyId.Name
+								if !resFieldSet[fieldName] {
+									resFieldSet[fieldName] = true
+									resFields = append(resFields, fieldName)
+								}
+								if !declaredVars[fieldName] {
+									declareVar(fieldName, &ast.Ident{Name: "string"}, nil)
+								}
+								val := extractArg(kv.Value)
+								bodyBuf.WriteString(fmt.Sprintf("v_%s := %s;\n", fieldName, val))
+							}
+						}
+					}
 					continue
 				}
 				if call, ok := res.(*ast.CallExpr); ok {

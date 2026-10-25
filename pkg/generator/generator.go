@@ -136,11 +136,28 @@ func GenerateCode(pkgPath string, procs []GeneratedProc) ([]byte, error) {
 		if len(results) == 1 && results[0] == "error" {
 			buf.WriteString(fmt.Sprintf("\terr := p.db.WithContext(ctx).Exec(%s).Error\n", callStmt))
 			buf.WriteString("\treturn err\n")
-		} else if len(results) >= 2 && results[len(results)-1] == "error" {
+		} else if len(results) == 2 && results[len(results)-1] == "error" {
 			resType := results[0]
 			buf.WriteString(fmt.Sprintf("\tvar result %s\n", resType))
 			buf.WriteString(fmt.Sprintf("\terr := p.db.WithContext(ctx).Raw(%s).Scan(&result).Error\n", callStmt))
 			buf.WriteString("\treturn result, err\n")
+		} else if len(results) > 2 && results[len(results)-1] == "error" {
+			var varNames []string
+			for i := 0; i < len(results)-1; i++ {
+				vName := fmt.Sprintf("result%d", i+1)
+				buf.WriteString(fmt.Sprintf("\tvar %s %s\n", vName, results[i]))
+				varNames = append(varNames, vName)
+			}
+			buf.WriteString(fmt.Sprintf("\trows, err := p.db.WithContext(ctx).Raw(%s).Rows()\n", callStmt))
+			buf.WriteString(fmt.Sprintf("\tif err != nil {\n\t\treturn %s, err\n\t}\n", strings.Join(varNames, ", ")))
+			buf.WriteString("\tdefer rows.Close()\n")
+			buf.WriteString(fmt.Sprintf("\terr = p.db.ScanRows(rows, &%s)\n", varNames[0]))
+			for i := 1; i < len(varNames); i++ {
+				buf.WriteString("\tif rows.NextResultSet() {\n")
+				buf.WriteString(fmt.Sprintf("\t\t_ = p.db.ScanRows(rows, &%s)\n", varNames[i]))
+				buf.WriteString("\t}\n")
+			}
+			buf.WriteString(fmt.Sprintf("\treturn %s, err\n", strings.Join(varNames, ", ")))
 		} else {
 			buf.WriteString(fmt.Sprintf("\terr := p.db.WithContext(ctx).Exec(%s).Error\n", callStmt))
 			buf.WriteString("\treturn err\n")
