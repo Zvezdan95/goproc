@@ -1,6 +1,9 @@
 package transpiler
 
 import (
+	"go/ast"
+	goParser "go/parser"
+	"go/token"
 	"strings"
 	"testing"
 
@@ -119,3 +122,235 @@ func TestTranspilers(t *testing.T) {
 		t.Errorf("MySQL UPDATE statements missing. Got:\n%s", myTransfer)
 	}
 }
+
+func parseCodeToProc(t *testing.T, name, code string) *parser.Procedure {
+	fset := token.NewFileSet()
+	f, err := goParser.ParseFile(fset, "test.go", code, 0)
+	if err != nil {
+		t.Fatalf("ParseFile failed: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == name {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatalf("Function %s not found in parsed code", name)
+	}
+	return &parser.Procedure{
+		Name: name,
+		Func: fn,
+	}
+}
+
+func TestReportDefectFixes(t *testing.T) {
+	// 1. Defect 2: Blank Identifier Suppression (_ = a should emit nothing, never v__)
+	codeBlank := `package test
+import "context"
+func BlankIdProc(ctx context.Context, m_id int64) {
+	_ = m_id
+}`
+	procBlank := parseCodeToProc(t, "BlankIdProc", codeBlank)
+	myBlank, err := ToMySQL(procBlank, "h1")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if strings.Contains(myBlank, "v__") {
+		t.Errorf("MySQL output contains blank identifier variable v__:\n%s", myBlank)
+	}
+	pgBlank, err := ToPostgres(procBlank, "h1")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	if strings.Contains(pgBlank, "v__") {
+		t.Errorf("Postgres output contains blank identifier variable v__:\n%s", pgBlank)
+	}
+
+	// 2. Defect 3: Type Cast Unwrapping & Primitive Types (uint64(id), uint32(status))
+	codeCast := `package test
+import (
+	"context"
+	"gorm.io/gorm"
+)
+func CastProc(ctx context.Context, id uint64, status uint32) {
+	var tx *gorm.DB
+	tx.Exec("UPDATE tbl SET status = ? WHERE id = ?", uint32(status), uint64(id))
+}`
+	procCast := parseCodeToProc(t, "CastProc", codeCast)
+	myCast, err := ToMySQL(procCast, "h2")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if !strings.Contains(myCast, "UPDATE tbl SET status = p_status WHERE id = p_id") {
+		t.Errorf("MySQL did not unwrap type casts. Got:\n%s", myCast)
+	}
+	pgCast, err := ToPostgres(procCast, "h2")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	if !strings.Contains(pgCast, "UPDATE tbl SET status = p_status WHERE id = p_id") {
+		t.Errorf("Postgres did not unwrap type casts. Got:\n%s", pgCast)
+	}
+
+	// 3. Defect 1: Fatal Empty Control Blocks (IF v_err IS NOT NULL THEN END IF;)
+	codeErrCheck := `package test
+import (
+	"context"
+	"gorm.io/gorm"
+)
+type Svc struct{}
+func (s *Svc) SubProc(ctx context.Context, id int64) error { return nil }
+func ErrProc(ctx context.Context, id int64) error {
+	var s Svc
+	if err := s.SubProc(ctx, id); err != nil {
+		return err
+	}
+	return nil
+}`
+	procErr := parseCodeToProc(t, "ErrProc", codeErrCheck)
+	myErr, err := ToMySQL(procErr, "h3")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if strings.Contains(myErr, "IF") || strings.Contains(myErr, "END IF;") {
+		t.Errorf("MySQL generated empty IF error block:\n%s", myErr)
+	}
+	if !strings.Contains(myErr, "CALL subproc(p_id);") {
+		t.Errorf("MySQL missing CALL subproc:\n%s", myErr)
+	}
+	pgErr, err := ToPostgres(procErr, "h3")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	if strings.Contains(pgErr, "IF") || strings.Contains(pgErr, "END IF;") {
+		t.Errorf("Postgres generated empty IF error block:\n%s", pgErr)
+	}
+	if !strings.Contains(pgErr, "CALL subproc(p_id);") {
+		t.Errorf("Postgres missing CALL subproc:\n%s", pgErr)
+	}
+
+	// 4. Defect 5: Multi-argument fmt.Sprintf -> CONCAT
+	codeSprintf := `package test
+import (
+	"context"
+	"fmt"
+)
+func SprintfProc(ctx context.Context, id int64, name string) {
+	msg := fmt.Sprintf("order_%d_user_%s", id, name)
+	_ = msg
+}`
+	procSprintf := parseCodeToProc(t, "SprintfProc", codeSprintf)
+	mySprintf, err := ToMySQL(procSprintf, "h4")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if !strings.Contains(mySprintf, "SET v_msg = CONCAT('order_', p_id, '_user_', p_name);") {
+		t.Errorf("MySQL Sprintf format mismatch. Got:\n%s", mySprintf)
+	}
+	pgSprintf, err := ToPostgres(procSprintf, "h4")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	if !strings.Contains(pgSprintf, "v_msg := CONCAT('order_', p_id, '_user_', p_name);") {
+		t.Errorf("Postgres Sprintf format mismatch. Got:\n%s", pgSprintf)
+	}
+
+	// 5. Defect 5: gormproc.LastInsertID polyfill transpilation
+	codeLastInsert := `package test
+import (
+	"context"
+	"github.com/user/gormproc"
+	"gorm.io/gorm"
+)
+func LastInsertProc(ctx context.Context) {
+	var tx *gorm.DB
+	id := gormproc.LastInsertID(tx)
+	_ = id
+}`
+	procLastInsert := parseCodeToProc(t, "LastInsertProc", codeLastInsert)
+	myLast, err := ToMySQL(procLastInsert, "h5")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if !strings.Contains(myLast, "LAST_INSERT_ID()") {
+		t.Errorf("MySQL LastInsertID missing. Got:\n%s", myLast)
+	}
+	pgLast, err := ToPostgres(procLastInsert, "h5")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	if !strings.Contains(pgLast, "LASTVAL()") {
+		t.Errorf("Postgres LastInsertID missing. Got:\n%s", pgLast)
+	}
+
+	// 6. Defect 7: Subquery inside SelectInto does not slice at inner FROM
+	codeSubquery := `package test
+import (
+	"context"
+	"github.com/user/gormproc"
+	"gorm.io/gorm"
+)
+func SubqueryProc(ctx context.Context, userID int64) {
+	var tx *gorm.DB
+	var vID int64
+	var vRole string
+	gormproc.SelectInto(tx, "SELECT id, (SELECT name FROM roles WHERE id = 1) AS role_name FROM users WHERE user_id = ?", userID, &vID, &vRole)
+}`
+	procSubquery := parseCodeToProc(t, "SubqueryProc", codeSubquery)
+	mySub, err := ToMySQL(procSubquery, "h6")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	expectedSelect := "SELECT id, (SELECT name FROM roles WHERE id = 1) AS role_name INTO v_vID, v_vRole FROM users WHERE user_id = p_userID;"
+	if !strings.Contains(mySub, expectedSelect) {
+		t.Errorf("MySQL SelectInto subquery split incorrectly. Got:\n%s", mySub)
+	}
+	pgSub, err := ToPostgres(procSubquery, "h6")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	if !strings.Contains(pgSub, expectedSelect) {
+		t.Errorf("Postgres SelectInto subquery split incorrectly. Got:\n%s", pgSub)
+	}
+
+	// 7. Defect 4: Return Values and Output Result Sets populated outside transaction
+	codeResField := `package test
+import (
+	"context"
+	"gorm.io/gorm"
+)
+type BookResult struct {
+	RoundID string
+	Balance float64
+}
+type BookService struct {
+	db *gorm.DB
+}
+func (s *BookService) Book(ctx context.Context, roundID string) (BookResult, error) {
+	var res BookResult
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		tx.Exec("UPDATE rounds SET status = 'BOOKED' WHERE id = ?", roundID)
+		return nil
+	})
+	res.RoundID = roundID
+	return res, err
+}`
+	procRes := parseCodeToProc(t, "Book", codeResField)
+	myRes, err := ToMySQL(procRes, "h7")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if !strings.Contains(myRes, "SELECT v_RoundID AS RoundID;") {
+		t.Errorf("MySQL missing result projection SELECT v_RoundID AS RoundID. Got:\n%s", myRes)
+	}
+	pgRes, err := ToPostgres(procRes, "h7")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	if !strings.Contains(pgRes, "SELECT v_RoundID AS RoundID;") {
+		t.Errorf("Postgres missing result projection SELECT v_RoundID AS RoundID. Got:\n%s", pgRes)
+	}
+}
+

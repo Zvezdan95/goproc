@@ -36,9 +36,11 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 					sqlType := "NUMERIC"
 					if id, ok := field.Type.(*ast.Ident); ok {
 						switch id.Name {
-						case "int64":
+						case "int64", "uint64", "uint32", "uint":
 							sqlType = "BIGINT"
-						case "float64":
+						case "int", "int32":
+							sqlType = "INTEGER"
+						case "float64", "float32":
 							sqlType = "NUMERIC"
 						case "bool":
 							sqlType = "BOOLEAN"
@@ -48,7 +50,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 					} else if se, ok := field.Type.(*ast.StarExpr); ok {
 						if id, ok := se.X.(*ast.Ident); ok {
 							switch id.Name {
-							case "int64":
+							case "int64", "uint64", "uint32":
 								sqlType = "BIGINT"
 							case "string":
 								sqlType = "VARCHAR(255)"
@@ -76,6 +78,9 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 			}
 			if e.Name == "false" {
 				return "FALSE"
+			}
+			if e.Name == "_" {
+				return "''"
 			}
 			if strings.HasPrefix(e.Name, "cConst_") || strings.HasPrefix(e.Name, "eError_") {
 				return e.Name
@@ -142,21 +147,40 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 		case *ast.ParenExpr:
 			return "(" + extractArg(e.X) + ")"
 		case *ast.CallExpr:
+			// 1. Go type cast
+			if funId, ok := e.Fun.(*ast.Ident); ok {
+				castTypes := map[string]bool{
+					"int": true, "int8": true, "int16": true, "int32": true, "int64": true,
+					"uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
+					"float32": true, "float64": true, "byte": true, "rune": true, "string": true,
+				}
+				if castTypes[funId.Name] && len(e.Args) == 1 {
+					return extractArg(e.Args[0])
+				}
+			}
+
+			// 2. fmt.Sprintf formatting
 			if sel, ok := e.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Sprintf" {
-				if len(e.Args) >= 2 {
+				if len(e.Args) >= 1 {
 					if lit, ok := e.Args[0].(*ast.BasicLit); ok {
 						format := strings.Trim(lit.Value, "\"")
-						parts := strings.Split(format, "%d")
-						if len(parts) == 2 {
-							return "CONCAT('" + parts[0] + "', " + extractArg(e.Args[1]) + ", '" + parts[1] + "')"
+						var strArgs []string
+						for i := 1; i < len(e.Args); i++ {
+							strArgs = append(strArgs, extractArg(e.Args[i]))
 						}
+						return formatToConcat(format, strArgs)
 					}
 				}
 			}
+
+			// 3. gormproc polyfills
 			if sel, ok := e.Fun.(*ast.SelectorExpr); ok {
 				if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name == "gormproc" {
 					if sel.Sel.Name == "JSONExtractFloat64" || sel.Sel.Name == "JSONExtractString" {
 						return "(" + extractArg(e.Args[0]) + " ->> " + extractArg(e.Args[1]) + ")"
+					}
+					if sel.Sel.Name == "LastInsertID" {
+						return "LASTVAL()"
 					}
 					if sel.Sel.Name == "CasinogameFeeCurrent" {
 						return "pokermem.Casinogame_fee_current(" + extractArg(e.Args[0]) + ")"
@@ -178,7 +202,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 
 	declaredVars := make(map[string]bool)
 	declareVar := func(name string, typeNode ast.Expr, valExpr ast.Expr) {
-		if declaredVars[name] || name == "res" || name == "err" {
+		if declaredVars[name] || name == "res" || name == "err" || name == "_" {
 			return
 		}
 		declaredVars[name] = true
@@ -187,9 +211,15 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 		typ := "VARCHAR"
 		if id, ok := typeNode.(*ast.Ident); ok {
 			switch id.Name {
-			case "int64":
+			case "int64", "uint64", "uint32", "uint":
 				typ = "BIGINT"
-			case "float64":
+			case "int", "int32":
+				typ = "INTEGER"
+			case "int16", "uint16":
+				typ = "SMALLINT"
+			case "int8", "uint8", "byte":
+				typ = "SMALLINT"
+			case "float64", "float32":
 				typ = "NUMERIC"
 			case "bool":
 				typ = "BOOLEAN"
@@ -209,6 +239,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 		varDecls.WriteString(fmt.Sprintf("\t%s %s%s;\n", "v_"+name, typ, def))
 	}
 
+	hasEmittedSelect := false
 	emitQuery := func(expr ast.Expr) bool {
 		if sel, ok := expr.(*ast.SelectorExpr); ok && sel.Sel.Name == "Error" {
 			expr = sel.X
@@ -233,6 +264,10 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 						query = strings.Replace(query, "?", extractArg(call.Args[i]), 1)
 					}
 					bodyBuf.WriteString(query + ";\n")
+					queryUpper := strings.ToUpper(strings.TrimSpace(query))
+					if strings.HasPrefix(queryUpper, "SELECT") {
+						hasEmittedSelect = true
+					}
 					return true
 				}
 			}
@@ -260,7 +295,8 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 		})
 	}
 
-	// AST walker for the procedure body
+	var resFields []string
+	resFieldSet := make(map[string]bool)
 	var walkStmt func(stmt ast.Stmt)
 	walkStmt = func(stmt ast.Stmt) {
 		switch s := stmt.(type) {
@@ -283,6 +319,13 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 				}
 			}
 		case *ast.AssignStmt:
+			if len(s.Lhs) > 0 {
+				if id, ok := s.Lhs[0].(*ast.Ident); ok && id.Name == "_" {
+					// Blank identifier (_ = val): ignore in SQL
+					return
+				}
+			}
+
 			var lhs string
 			if len(s.Lhs) > 0 {
 				if id, ok := s.Lhs[0].(*ast.Ident); ok {
@@ -291,7 +334,18 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 					}
 					lhs = "v_" + id.Name
 				} else if sel, ok := s.Lhs[0].(*ast.SelectorExpr); ok {
-					lhs = "v_" + sel.Sel.Name
+					fieldName := sel.Sel.Name
+					lhs = "v_" + fieldName
+					// Track struct result assignments (e.g. res.RoundID = ...)
+					if xId, ok := sel.X.(*ast.Ident); ok && xId.Name == "res" {
+						if !resFieldSet[fieldName] {
+							resFieldSet[fieldName] = true
+							resFields = append(resFields, fieldName)
+						}
+						if !declaredVars[fieldName] {
+							declareVar(fieldName, &ast.Ident{Name: "string"}, nil)
+						}
+					}
 				}
 			}
 
@@ -387,59 +441,76 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 				walkStmt(stmt)
 			}
 		case *ast.IfStmt:
+			handledInit := false
 			if s.Init != nil {
 				if assign, ok := s.Init.(*ast.AssignStmt); ok {
 					if len(assign.Rhs) > 0 {
 						if emitQuery(assign.Rhs[0]) {
-							if bin, ok := s.Cond.(*ast.BinaryExpr); ok {
-								if id, ok := bin.X.(*ast.Ident); ok && id.Name == "err" {
-									return
-								}
-							}
-						}
-					}
-					if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
-						if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-							if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name == "gormproc" && sel.Sel.Name == "SelectInto" {
-								if len(call.Args) >= 2 {
-									if queryLit, ok := call.Args[1].(*ast.BasicLit); ok {
-										query := strings.Trim(queryLit.Value, "`\"")
-										query = strings.ReplaceAll(query, "\n", " ")
-										query = strings.ReplaceAll(query, "\t", " ")
+							handledInit = true
+						} else if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
+							if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+								if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name == "gormproc" && sel.Sel.Name == "SelectInto" {
+									if len(call.Args) >= 2 {
+										if queryLit, ok := call.Args[1].(*ast.BasicLit); ok {
+											query := strings.Trim(queryLit.Value, "`\"")
+											query = strings.ReplaceAll(query, "\n", " ")
+											query = strings.ReplaceAll(query, "\t", " ")
 
-										numQs := strings.Count(query, "?")
-										inArgs := call.Args[2 : 2+numQs]
-										outArgs := call.Args[2+numQs:]
+											numQs := strings.Count(query, "?")
+											inArgs := call.Args[2 : 2+numQs]
+											outArgs := call.Args[2+numQs:]
 
-										for _, inArg := range inArgs {
-											query = strings.Replace(query, "?", extractArg(inArg), 1)
-										}
-
-										idxFrom := strings.Index(strings.ToUpper(query), " FROM ")
-										if idxFrom != -1 {
-											selectPart := query[:idxFrom]
-											fromPart := query[idxFrom:]
-
-											var outs []string
-											for _, outArg := range outArgs {
-												outs = append(outs, extractArg(outArg))
+											for _, inArg := range inArgs {
+												query = strings.Replace(query, "?", extractArg(inArg), 1)
 											}
 
-											bodyBuf.WriteString(fmt.Sprintf("%s INTO %s %s;\n", selectPart, strings.Join(outs, ", "), fromPart))
+												idxFrom := findTopLevelFrom(query)
+												if idxFrom != -1 {
+													selectPart := query[:idxFrom]
+													fromPart := query[idxFrom:]
+
+													var outs []string
+													for _, outArg := range outArgs {
+														outs = append(outs, extractArg(outArg))
+													}
+
+													bodyBuf.WriteString(fmt.Sprintf("%s INTO %s %s;\n", strings.TrimSpace(selectPart), strings.Join(outs, ", "), strings.TrimSpace(fromPart)))
+													handledInit = true
+												}
+											}
 										}
+								} else {
+									args := []string{}
+									for _, arg := range call.Args {
+										if id, ok := arg.(*ast.Ident); ok && id.Name == "ctx" {
+											continue
+										}
+										args = append(args, extractArg(arg))
 									}
+									funcName := strings.ToLower(sel.Sel.Name)
+									bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
+									handledInit = true
 								}
-							} else if _, ok := sel.X.(*ast.SelectorExpr); ok {
+							} else if id, ok := call.Fun.(*ast.Ident); ok {
 								args := []string{}
 								for _, arg := range call.Args {
+									if id, ok := arg.(*ast.Ident); ok && id.Name == "ctx" {
+										continue
+									}
 									args = append(args, extractArg(arg))
 								}
-								funcName := strings.ToLower(sel.Sel.Name)
+								funcName := strings.ToLower(id.Name)
 								bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
+								handledInit = true
 							}
 						}
 					}
 				}
+			}
+
+			// If init handled a query/subprocedure and condition is standard error check, omit empty IF block
+			if handledInit && isErrCheck(s.Cond) && isBoilerplateErrorReturn(s.Body) && s.Else == nil {
+				return
 			}
 
 			bodyBuf.WriteString("IF " + extractArg(s.Cond))
@@ -473,7 +544,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 				return
 			}
 			if call, ok := s.X.(*ast.CallExpr); ok {
-				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.X != nil {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 					if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name == "gormproc" {
 						if sel.Sel.Name == "SelectInto" {
 							if len(call.Args) >= 2 {
@@ -490,7 +561,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 										query = strings.Replace(query, "?", extractArg(inArg), 1)
 									}
 
-									idxFrom := strings.Index(strings.ToUpper(query), " FROM ")
+									idxFrom := findTopLevelFrom(query)
 									if idxFrom != -1 {
 										selectPart := query[:idxFrom]
 										fromPart := query[idxFrom:]
@@ -500,34 +571,68 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 											outs = append(outs, extractArg(outArg))
 										}
 
-										bodyBuf.WriteString(fmt.Sprintf("%s INTO %s %s;\n", selectPart, strings.Join(outs, ", "), fromPart))
+										bodyBuf.WriteString(fmt.Sprintf("%s INTO %s %s;\n", strings.TrimSpace(selectPart), strings.Join(outs, ", "), strings.TrimSpace(fromPart)))
 									}
 								}
 							}
 						}
+					} else {
+						args := []string{}
+						for _, arg := range call.Args {
+							if id, ok := arg.(*ast.Ident); ok && id.Name == "ctx" {
+								continue
+							}
+							args = append(args, extractArg(arg))
+						}
+						funcName := strings.ToLower(sel.Sel.Name)
+						bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
 					}
+				} else if id, ok := call.Fun.(*ast.Ident); ok {
+					args := []string{}
+					for _, arg := range call.Args {
+						if id, ok := arg.(*ast.Ident); ok && id.Name == "ctx" {
+							continue
+						}
+						args = append(args, extractArg(arg))
+					}
+					funcName := strings.ToLower(id.Name)
+					bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
 				}
 			}
 		}
 	}
 
-	foundTx := false
-	ast.Inspect(proc.Func, func(n ast.Node) bool {
-		if call, ok := n.(*ast.CallExpr); ok {
-			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Transaction" {
-				if len(call.Args) > 0 {
-					if lit, ok := call.Args[0].(*ast.FuncLit); ok {
-						foundTx = true
-						walkStmt(lit.Body)
+	// Walk top-level statements, and if a statement is or contains a Transaction call, walk inside it
+	if proc.Func.Body != nil {
+		for _, stmt := range proc.Func.Body.List {
+			handledTx := false
+			ast.Inspect(stmt, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Transaction" {
+						if len(call.Args) > 0 {
+							if lit, ok := call.Args[0].(*ast.FuncLit); ok {
+								handledTx = true
+								walkStmt(lit.Body)
+							}
+						}
 					}
 				}
+				return true
+			})
+			if !handledTx {
+				walkStmt(stmt)
 			}
 		}
-		return true
-	})
+	}
 
-	if !foundTx && proc.Func.Body != nil {
-		walkStmt(proc.Func.Body)
+	// If struct fields were assigned (e.g. res.RoundID = ...) and no terminating SELECT query was emitted,
+	// emit the result projection SELECT statement so GORM Raw().Scan() receives the row.
+	if len(resFields) > 0 && !hasEmittedSelect {
+		var selectCols []string
+		for _, field := range resFields {
+			selectCols = append(selectCols, fmt.Sprintf("v_%s AS %s", field, field))
+		}
+		bodyBuf.WriteString(fmt.Sprintf("SELECT %s;\n", strings.Join(selectCols, ", ")))
 	}
 
 	var finalBuf bytes.Buffer

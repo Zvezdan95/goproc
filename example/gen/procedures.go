@@ -50,7 +50,7 @@ func (p *gormProcedures) TransferFunds(ctx context.Context, fromID int64, toID i
 
 func (p *gormProcedures) GetOptionalData(ctx context.Context, userID int64, defaultNote *string) (procedures.OptionalData, error) {
 	var result procedures.OptionalData
-	err := p.db.WithContext(ctx).Raw("CALL getoptionaldata_4b5adaf5(?, ?)", userID, defaultNote).Scan(&result).Error
+	err := p.db.WithContext(ctx).Raw("CALL getoptionaldata_4b21c7ef(?, ?)", userID, defaultNote).Scan(&result).Error
 	return result, err
 }
 
@@ -78,11 +78,11 @@ var sql_transferfunds_de53908f_pg string
 //go:embed transferfunds_de53908f.mysql.sql
 var sql_transferfunds_de53908f_my string
 
-//go:embed getoptionaldata_4b5adaf5.postgres.sql
-var sql_getoptionaldata_4b5adaf5_pg string
+//go:embed getoptionaldata_4b21c7ef.postgres.sql
+var sql_getoptionaldata_4b21c7ef_pg string
 
-//go:embed getoptionaldata_4b5adaf5.mysql.sql
-var sql_getoptionaldata_4b5adaf5_my string
+//go:embed getoptionaldata_4b21c7ef.mysql.sql
+var sql_getoptionaldata_4b21c7ef_my string
 
 var RegisteredProcedures = []gormproc.ProcedureMeta{
 	{
@@ -115,9 +115,9 @@ var RegisteredProcedures = []gormproc.ProcedureMeta{
 	},
 	{
 		BaseName:    "getoptionaldata",
-		Hash:        "4b5adaf5",
-		FullName:    "getoptionaldata_4b5adaf5",
-		PostgresSQL: sql_getoptionaldata_4b5adaf5_pg,
-		MySQLSQL:    sql_getoptionaldata_4b5adaf5_my,
+		Hash:        "4b21c7ef",
+		FullName:    "getoptionaldata_4b21c7ef",
+		PostgresSQL: sql_getoptionaldata_4b21c7ef_pg,
+		MySQLSQL:    sql_getoptionaldata_4b21c7ef_my,
 	},
 }

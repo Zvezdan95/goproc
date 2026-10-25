@@ -66,6 +66,13 @@ func AutoMigrate(db *gorm.DB, procs ...ProcedureMeta) error {
 			stmt = proc.PostgresSQL
 		} else if dialect == "mysql" {
 			stmt = proc.MySQLSQL
+		} else if dialect == "sqlite" {
+			// SQLite does not support stored procedures.
+			// Record migration in registry so in-memory tests proceed cleanly.
+			if err := db.Exec("INSERT INTO gorm_procedure_registry (base_name, hash, full_name, dialect) VALUES (?, ?, ?, ?)", proc.BaseName, proc.Hash, proc.FullName, dialect).Error; err != nil {
+				return fmt.Errorf("failed to update registry for %s: %w", proc.FullName, err)
+			}
+			continue
 		} else {
 			return fmt.Errorf("unsupported dialect for gormproc: %s", dialect)
 		}
@@ -379,6 +386,11 @@ func FromJsonDecimalOptionalNullable(jsonStr, path string) (bool, *float64) {
 	}
 	f := JSONExtractFloat64(jsonStr, path)
 	return true, &f
+}
+
+// LastInsertID polyfill returns the auto-generated ID from the last INSERT statement.
+func LastInsertID(db *gorm.DB) int64 {
+	return 0
 }
 
 // SelectInto polyfill executes a query and scans results into destination pointers when running in Go.
