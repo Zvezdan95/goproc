@@ -1,7 +1,12 @@
 package gormproc
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
+	"strconv"
+	"strings"
 
 	"gorm.io/gorm"
 )
@@ -18,7 +23,7 @@ type ProcedureMeta struct {
 // AutoMigrate applies the given procedure definitions to the active database dialect.
 func AutoMigrate(db *gorm.DB, procs ...ProcedureMeta) error {
 	dialect := db.Dialector.Name()
-	
+
 	// Ensure the metadata table exists
 	createTableSQL := `
 		CREATE TABLE IF NOT EXISTS gorm_procedure_registry (
@@ -50,7 +55,7 @@ func AutoMigrate(db *gorm.DB, procs ...ProcedureMeta) error {
 		if err := db.Table("gorm_procedure_registry").Where("full_name = ?", proc.FullName).Count(&existingCount).Error; err != nil {
 			return fmt.Errorf("failed to check procedure registry for %s: %w", proc.FullName, err)
 		}
-		
+
 		if existingCount > 0 {
 			// Already migrated this exact version
 			continue
@@ -73,7 +78,7 @@ func AutoMigrate(db *gorm.DB, procs ...ProcedureMeta) error {
 			if err := tx.Exec(stmt).Error; err != nil {
 				return fmt.Errorf("failed to execute CREATE PROCEDURE for %s: %w", proc.FullName, err)
 			}
-			
+
 			// Record the migration
 			if err := tx.Exec("INSERT INTO gorm_procedure_registry (base_name, hash, full_name, dialect) VALUES (?, ?, ?, ?)", proc.BaseName, proc.Hash, proc.FullName, dialect).Error; err != nil {
 				return fmt.Errorf("failed to update registry for %s: %w", proc.FullName, err)
@@ -92,53 +97,300 @@ func AutoMigrate(db *gorm.DB, procs ...ProcedureMeta) error {
 // BaseService is embedded in any struct that contains procedure methods.
 type BaseService struct{}
 
-// JSONExtractString is the Go polyfill for MySQL JSON_EXTRACT / Postgres JSONB ->>
+// pathToken represents a single element in a JSON path.
+type pathToken struct {
+	isIndex bool
+	index   int
+	key     string
+}
+
+func parseJSONPath(path string) []pathToken {
+	path = strings.TrimSpace(path)
+	if strings.HasPrefix(path, "$") {
+		path = path[1:]
+	}
+	var tokens []pathToken
+	i := 0
+	n := len(path)
+	for i < n {
+		if path[i] == '.' {
+			i++
+			continue
+		}
+		if path[i] == '[' {
+			i++
+			end := strings.IndexByte(path[i:], ']')
+			if end == -1 {
+				break
+			}
+			idxStr := path[i : i+end]
+			i += end + 1
+			idx, err := strconv.Atoi(idxStr)
+			if err == nil {
+				tokens = append(tokens, pathToken{isIndex: true, index: idx})
+			}
+			continue
+		}
+		start := i
+		for i < n && path[i] != '.' && path[i] != '[' {
+			i++
+		}
+		key := path[start:i]
+		if key != "" {
+			tokens = append(tokens, pathToken{isIndex: false, key: key})
+		}
+	}
+	return tokens
+}
+
+func extractJSONPath(jsonStr, path string) interface{} {
+	if strings.TrimSpace(jsonStr) == "" {
+		return nil
+	}
+	var current interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &current); err != nil {
+		return nil
+	}
+	tokens := parseJSONPath(path)
+	for _, t := range tokens {
+		if current == nil {
+			return nil
+		}
+		if t.isIndex {
+			arr, ok := current.([]interface{})
+			if !ok || t.index < 0 || t.index >= len(arr) {
+				return nil
+			}
+			current = arr[t.index]
+		} else {
+			m, ok := current.(map[string]interface{})
+			if !ok {
+				return nil
+			}
+			val, exists := m[t.key]
+			if !exists {
+				return nil
+			}
+			current = val
+		}
+	}
+	return current
+}
+
+// JSONExtractString is the Go polyfill for MySQL JSON_UNQUOTE(JSON_EXTRACT(...)) / Postgres ->>
 func JSONExtractString(jsonStr, path string) string {
-	// Native Go execution logic for when the procedure runs in Go-memory
-	return ""
+	val := extractJSONPath(jsonStr, path)
+	if val == nil {
+		return ""
+	}
+	switch v := val.(type) {
+	case string:
+		return v
+	case fmt.Stringer:
+		return v.String()
+	case float64:
+		// Format without scientific notation for common numbers
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(v)
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
 }
 
 // JSONLength is the Go polyfill for MySQL JSON_LENGTH
 func JSONLength(jsonStr, path string) int64 {
-	// Native Go execution logic 
-	return 0
+	val := extractJSONPath(jsonStr, path)
+	if val == nil {
+		return 0
+	}
+	switch v := val.(type) {
+	case []interface{}:
+		return int64(len(v))
+	case map[string]interface{}:
+		return int64(len(v))
+	default:
+		return 1
+	}
+}
+
+// JSONExtractFloat64 polyfill extracts a numeric value from a JSON document.
+func JSONExtractFloat64(jsonStr, path string) float64 {
+	val := extractJSONPath(jsonStr, path)
+	if val == nil {
+		return 0
+	}
+	switch v := val.(type) {
+	case float64:
+		return v
+	case int64:
+		return float64(v)
+	case int:
+		return float64(v)
+	case string:
+		f, _ := strconv.ParseFloat(v, 64)
+		return f
+	default:
+		return 0
+	}
 }
 
 // JSONMergePreserve polyfill
-func JSONMergePreserve(json1, json2 string) string { return "" }
+func JSONMergePreserve(json1, json2 string) string {
+	var val1, val2 interface{}
+	if err := json.Unmarshal([]byte(json1), &val1); err != nil {
+		return json2
+	}
+	if err := json.Unmarshal([]byte(json2), &val2); err != nil {
+		return json1
+	}
+	merged := []interface{}{val1, val2}
+	b, _ := json.Marshal(merged)
+	return string(b)
+}
 
 // JSONArrayAppend polyfill
-func JSONArrayAppend(jsonStr, path string, val interface{}) string { return "" }
+func JSONArrayAppend(jsonStr, path string, val interface{}) string {
+	var root interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &root); err != nil {
+		return jsonStr
+	}
+	if arr, ok := root.([]interface{}); ok {
+		arr = append(arr, val)
+		b, _ := json.Marshal(arr)
+		return string(b)
+	}
+	return jsonStr
+}
 
 // FromJsonString polyfill
-func FromJsonString(jsonStr, path string) string { return "" }
+func FromJsonString(jsonStr, path string) string {
+	return JSONExtractString(jsonStr, path)
+}
 
 // FromJsonStringOptional polyfill
-func FromJsonStringOptional(jsonStr, path string) *string { return nil }
+func FromJsonStringOptional(jsonStr, path string) *string {
+	val := extractJSONPath(jsonStr, path)
+	if val == nil {
+		return nil
+	}
+	res := JSONExtractString(jsonStr, path)
+	return &res
+}
 
 // FromJsonArray polyfill
-func FromJsonArray(jsonStr, path string) string { return "" }
+func FromJsonArray(jsonStr, path string) string {
+	val := extractJSONPath(jsonStr, path)
+	if val == nil {
+		return "[]"
+	}
+	b, err := json.Marshal(val)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
 
 // FromJsonInt64 polyfill
-func FromJsonInt64(jsonStr, path string) int64 { return 0 }
+func FromJsonInt64(jsonStr, path string) int64 {
+	val := extractJSONPath(jsonStr, path)
+	if val == nil {
+		return 0
+	}
+	switch v := val.(type) {
+	case float64:
+		return int64(v)
+	case int64:
+		return v
+	case string:
+		n, _ := strconv.ParseInt(v, 10, 64)
+		return n
+	default:
+		return 0
+	}
+}
 
-// JSONOverlaps polyfill
-func JSONOverlaps(json1, json2 string) bool { return false }
+// JSONOverlaps polyfill checks if two JSON documents share any common elements or key-values.
+func JSONOverlaps(json1, json2 string) bool {
+	var val1, val2 interface{}
+	if err := json.Unmarshal([]byte(json1), &val1); err != nil {
+		return false
+	}
+	if err := json.Unmarshal([]byte(json2), &val2); err != nil {
+		return false
+	}
+
+	arr1, isArr1 := val1.([]interface{})
+	arr2, isArr2 := val2.([]interface{})
+	if isArr1 && isArr2 {
+		for _, item1 := range arr1 {
+			for _, item2 := range arr2 {
+				if reflect.DeepEqual(item1, item2) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	map1, isMap1 := val1.(map[string]interface{})
+	map2, isMap2 := val2.(map[string]interface{})
+	if isMap1 && isMap2 {
+		for k, v1 := range map1 {
+			if v2, ok := map2[k]; ok {
+				if reflect.DeepEqual(v1, v2) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	return reflect.DeepEqual(val1, val2)
+}
 
 // CasinogameCalcJackpotContribution polyfill
-func CasinogameCalcJackpotContribution(fee float64, amount float64) float64 { return 0 }
+func CasinogameCalcJackpotContribution(fee float64, amount float64) float64 {
+	return (fee * amount) / 100.0
+}
 
 // CasinogameFeeCurrent polyfill
-func CasinogameFeeCurrent(cgId int64) float64 { return 0 }
+func CasinogameFeeCurrent(cgId int64) float64 {
+	return 0
+}
 
-// GlobHasBits polyfill
-func GlobHasBits(flags uint64, mask uint64) bool { return false }
-
-// JSONExtractFloat64 polyfill
-func JSONExtractFloat64(jsonStr, path string) float64 { return 0 }
+// GlobHasBits polyfill checks if mask bits are set in flags.
+func GlobHasBits(flags uint64, mask uint64) bool {
+	return (flags & mask) == mask
+}
 
 // FromJsonDecimalOptionalNullable polyfill
-func FromJsonDecimalOptionalNullable(jsonStr, path string) (bool, *float64) { return false, nil }
+func FromJsonDecimalOptionalNullable(jsonStr, path string) (bool, *float64) {
+	val := extractJSONPath(jsonStr, path)
+	if val == nil {
+		return false, nil
+	}
+	f := JSONExtractFloat64(jsonStr, path)
+	return true, &f
+}
 
-// SelectInto polyfill for SELECT ... INTO ...
-func SelectInto(db *gorm.DB, query string, args ...interface{}) error { return nil }
+// SelectInto polyfill executes a query and scans results into destination pointers when running in Go.
+func SelectInto(db *gorm.DB, query string, args ...interface{}) error {
+	if db == nil {
+		return errors.New("gormproc: db cannot be nil")
+	}
+	numQs := strings.Count(query, "?")
+	if len(args) < numQs {
+		return fmt.Errorf("gormproc: expected at least %d input args for query, got %d", numQs, len(args))
+	}
+	inArgs := args[:numQs]
+	outPtrs := args[numQs:]
+	return db.Raw(query, inArgs...).Row().Scan(outPtrs...)
+}
