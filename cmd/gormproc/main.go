@@ -19,7 +19,7 @@ func main() {
 	var out string
 
 	flag.StringVar(&dir, "dir", ".", "Directory containing Go files to parse")
-	flag.StringVar(&pkg, "pkg", "myproject/procedures", "Import path of the procedures package")
+	flag.StringVar(&pkg, "pkg", "github.com/user/gormproc/example/procedures", "Import path of the procedures package")
 	flag.StringVar(&out, "out", "gen/procedures.go", "Output file for generated code")
 	flag.Parse()
 

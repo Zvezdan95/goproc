@@ -3,9 +3,10 @@ package gen
 
 import (
 	"context"
+	_ "embed"
 	"github.com/user/gormproc"
+	"github.com/user/gormproc/example/procedures"
 	"gorm.io/gorm"
-	"myproject/procedures"
 )
 
 type Procedures interface {
@@ -26,173 +27,97 @@ func NewProcedures(db *gorm.DB) Procedures {
 
 func (p *gormProcedures) ProcessBilling(ctx context.Context, userID int64, amount float64) (procedures.BillingResult, error) {
 	var result procedures.BillingResult
-	err := p.db.WithContext(ctx).Raw("CALL processbilling_f59ea039(?, ?)", userID, amount).Scan(&result).Error
+	err := p.db.WithContext(ctx).Raw("CALL processbilling_8adc139b(?, ?)", userID, amount).Scan(&result).Error
 	return result, err
 }
 
 func (p *gormProcedures) ComplexFormatTest(ctx context.Context, action int64, data string) error {
-	var result error
-	err := p.db.WithContext(ctx).Raw("CALL complexformattest_99bb99b3(?, ?)", action, data).Scan(&result).Error
-	return result, err
+	err := p.db.WithContext(ctx).Exec("CALL complexformattest_a1e80486(?, ?)", action, data).Error
+	return err
 }
 
 func (p *gormProcedures) UpdateUserStatus(ctx context.Context, userID int64, isActive bool) (procedures.UserStatusResult, error) {
 	var result procedures.UserStatusResult
-	err := p.db.WithContext(ctx).Raw("CALL updateuserstatus_f1292a21(?, ?)", userID, isActive).Scan(&result).Error
+	err := p.db.WithContext(ctx).Raw("CALL updateuserstatus_22e2f6ef(?, ?)", userID, isActive).Scan(&result).Error
 	return result, err
 }
 
 func (p *gormProcedures) TransferFunds(ctx context.Context, fromID int64, toID int64, amount float64) (bool, error) {
 	var result bool
-	err := p.db.WithContext(ctx).Raw("CALL transferfunds_cc86ae9c(?, ?, ?)", fromID, toID, amount).Scan(&result).Error
+	err := p.db.WithContext(ctx).Raw("CALL transferfunds_de53908f(?, ?, ?)", fromID, toID, amount).Scan(&result).Error
 	return result, err
 }
 
 func (p *gormProcedures) GetOptionalData(ctx context.Context, userID int64, defaultNote *string) (procedures.OptionalData, error) {
 	var result procedures.OptionalData
-	err := p.db.WithContext(ctx).Raw("CALL getoptionaldata_9a68d2b1(?, ?)", userID, defaultNote).Scan(&result).Error
+	err := p.db.WithContext(ctx).Raw("CALL getoptionaldata_4b5adaf5(?, ?)", userID, defaultNote).Scan(&result).Error
 	return result, err
 }
 
+//go:embed processbilling_8adc139b.postgres.sql
+var sql_processbilling_8adc139b_pg string
+
+//go:embed processbilling_8adc139b.mysql.sql
+var sql_processbilling_8adc139b_my string
+
+//go:embed complexformattest_a1e80486.postgres.sql
+var sql_complexformattest_a1e80486_pg string
+
+//go:embed complexformattest_a1e80486.mysql.sql
+var sql_complexformattest_a1e80486_my string
+
+//go:embed updateuserstatus_22e2f6ef.postgres.sql
+var sql_updateuserstatus_22e2f6ef_pg string
+
+//go:embed updateuserstatus_22e2f6ef.mysql.sql
+var sql_updateuserstatus_22e2f6ef_my string
+
+//go:embed transferfunds_de53908f.postgres.sql
+var sql_transferfunds_de53908f_pg string
+
+//go:embed transferfunds_de53908f.mysql.sql
+var sql_transferfunds_de53908f_my string
+
+//go:embed getoptionaldata_4b5adaf5.postgres.sql
+var sql_getoptionaldata_4b5adaf5_pg string
+
+//go:embed getoptionaldata_4b5adaf5.mysql.sql
+var sql_getoptionaldata_4b5adaf5_my string
+
 var RegisteredProcedures = []gormproc.ProcedureMeta{
 	{
-		BaseName: "processbilling",
-		Hash:     "f59ea039",
-		FullName: "processbilling_f59ea039",
-		PostgresSQL: `CREATE OR REPLACE PROCEDURE
-processbilling_f59ea039(p_userID BIGINT, p_amount NUMERIC)
-LANGUAGE plpgsql AS $$
-#variable_conflict use_variable
-BEGIN
-IF p_amount <= 0 THEN
-RAISE EXCEPTION "amount must be greater than zero";
-END IF;
-END;
-$$;`,
-		MySQLSQL: `CREATE PROCEDURE processbilling_f59ea039(IN p_userID BIGINT, IN p_amount DOUBLE)
-BEGIN
-	IF p_amount <= 0 THEN
-		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "amount must be greater than zero";
-	END IF;
-END;`,
+		BaseName:    "processbilling",
+		Hash:        "8adc139b",
+		FullName:    "processbilling_8adc139b",
+		PostgresSQL: sql_processbilling_8adc139b_pg,
+		MySQLSQL:    sql_processbilling_8adc139b_my,
 	},
 	{
-		BaseName: "complexformattest",
-		Hash:     "99bb99b3",
-		FullName: "complexformattest_99bb99b3",
-		PostgresSQL: `CREATE OR REPLACE PROCEDURE
-complexformattest_99bb99b3(p_action BIGINT, p_data VARCHAR)
-LANGUAGE plpgsql AS $$
-#variable_conflict use_variable
-BEGIN
-IF p_action = 1 THEN
-ELSE
-END IF;
-END;
-$$;`,
-		MySQLSQL: `CREATE PROCEDURE complexformattest_99bb99b3(IN p_action BIGINT, IN p_data VARCHAR(255))
-BEGIN
-	DECLARE v_status TEXT;
-	DECLARE v_i BIGINT;
-	IF p_action = 1 THEN
-		SET v_status = "START";
-	ELSE
-		SET v_status = "STOP";
-	END IF;
-	SET v_i = 0;
-	WHILE v_i < 5 DO
-		IF p_status = "START" THEN
-			CASE p_action
-			WHEN 1 THEN
-				SET v_status = "ONGOING";
-			WHEN 2 THEN
-				SET v_status = "PAUSED";
-			END CASE;
-		END IF;
-	END WHILE;
-END;`,
+		BaseName:    "complexformattest",
+		Hash:        "a1e80486",
+		FullName:    "complexformattest_a1e80486",
+		PostgresSQL: sql_complexformattest_a1e80486_pg,
+		MySQLSQL:    sql_complexformattest_a1e80486_my,
 	},
 	{
-		BaseName: "updateuserstatus",
-		Hash:     "f1292a21",
-		FullName: "updateuserstatus_f1292a21",
-		PostgresSQL: `CREATE OR REPLACE PROCEDURE
-updateuserstatus_f1292a21(p_userID BIGINT, p_isActive BOOLEAN)
-LANGUAGE plpgsql AS $$
-#variable_conflict use_variable
-BEGIN
-IF p_isActive = TRUE THEN
-ELSE
-END IF;
-IF p_err IS NOT NULL THEN
-END IF;
-END;
-$$;`,
-		MySQLSQL: `CREATE PROCEDURE updateuserstatus_f1292a21(IN p_userID BIGINT, IN p_isActive BOOLEAN)
-BEGIN
-	IF 1=1 THEN
-		SET v_newStatus = "ACTIVE";
-	ELSE
-		SET v_newStatus = "INACTIVE";
-	END IF;
-	IF p_err != p_nil THEN
-	END IF;
-END;`,
+		BaseName:    "updateuserstatus",
+		Hash:        "22e2f6ef",
+		FullName:    "updateuserstatus_22e2f6ef",
+		PostgresSQL: sql_updateuserstatus_22e2f6ef_pg,
+		MySQLSQL:    sql_updateuserstatus_22e2f6ef_my,
 	},
 	{
-		BaseName: "transferfunds",
-		Hash:     "cc86ae9c",
-		FullName: "transferfunds_cc86ae9c",
-		PostgresSQL: `CREATE OR REPLACE PROCEDURE
-transferfunds_cc86ae9c(p_fromID BIGINT, p_toID BIGINT, p_amount NUMERIC)
-LANGUAGE plpgsql AS $$
-#variable_conflict use_variable
-BEGIN
-IF p_amount <= 0 THEN
-RAISE EXCEPTION "invalid transfer amount";
-END IF;
-IF p_fromID = p_toID THEN
-RAISE EXCEPTION "cannot transfer to self";
-END IF;
-IF p_err IS NOT NULL THEN
-END IF;
-IF p_err IS NOT NULL THEN
-END IF;
-END;
-$$;`,
-		MySQLSQL: `CREATE PROCEDURE transferfunds_cc86ae9c(IN p_fromID BIGINT, IN p_toID BIGINT, IN p_amount DOUBLE)
-BEGIN
-	IF p_amount <= 0 THEN
-		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "invalid transfer amount";
-	END IF;
-	IF p_fromID = p_toID THEN
-		SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "cannot transfer to self";
-	END IF;
-	IF p_err != p_nil THEN
-	END IF;
-	IF p_err != p_nil THEN
-	END IF;
-	SET v_success = p_true;
-END;`,
+		BaseName:    "transferfunds",
+		Hash:        "de53908f",
+		FullName:    "transferfunds_de53908f",
+		PostgresSQL: sql_transferfunds_de53908f_pg,
+		MySQLSQL:    sql_transferfunds_de53908f_my,
 	},
 	{
-		BaseName: "getoptionaldata",
-		Hash:     "9a68d2b1",
-		FullName: "getoptionaldata_9a68d2b1",
-		PostgresSQL: `CREATE OR REPLACE PROCEDURE
-getoptionaldata_9a68d2b1(p_userID BIGINT, p_defaultNote VARCHAR)
-LANGUAGE plpgsql AS $$
-#variable_conflict use_variable
-BEGIN
-IF p_defaultNote IS NULL THEN
-END IF;
-END;
-$$;`,
-		MySQLSQL: `CREATE PROCEDURE getoptionaldata_9a68d2b1(IN p_userID BIGINT, IN p_defaultNote VARCHAR(255))
-BEGIN
-	IF p_defaultNote = p_nil THEN
-	END IF;
-	SET  = p_defaultNote;
-END;`,
+		BaseName:    "getoptionaldata",
+		Hash:        "4b5adaf5",
+		FullName:    "getoptionaldata_4b5adaf5",
+		PostgresSQL: sql_getoptionaldata_4b5adaf5_pg,
+		MySQLSQL:    sql_getoptionaldata_4b5adaf5_my,
 	},
 }

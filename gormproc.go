@@ -20,22 +20,36 @@ func AutoMigrate(db *gorm.DB, procs ...ProcedureMeta) error {
 	dialect := db.Dialector.Name()
 	
 	// Ensure the metadata table exists
-	err := db.Exec(`
+	createTableSQL := `
 		CREATE TABLE IF NOT EXISTS gorm_procedure_registry (
 			base_name VARCHAR(128) NOT NULL,
 			hash VARCHAR(8) NOT NULL,
 			full_name VARCHAR(137) NOT NULL PRIMARY KEY,
 			dialect VARCHAR(32) NOT NULL,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
-	`).Error
+	`
+	if dialect == "postgres" {
+		createTableSQL = `
+			CREATE TABLE IF NOT EXISTS gorm_procedure_registry (
+				base_name VARCHAR(128) NOT NULL,
+				hash VARCHAR(8) NOT NULL,
+				full_name VARCHAR(137) NOT NULL PRIMARY KEY,
+				dialect VARCHAR(32) NOT NULL,
+				created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+			);
+		`
+	}
+	err := db.Exec(createTableSQL).Error
 	if err != nil {
 		return fmt.Errorf("failed to create procedure registry table: %w", err)
 	}
 
 	for _, proc := range procs {
 		var existingCount int64
-		db.Table("gorm_procedure_registry").Where("full_name = ?", proc.FullName).Count(&existingCount)
+		if err := db.Table("gorm_procedure_registry").Where("full_name = ?", proc.FullName).Count(&existingCount).Error; err != nil {
+			return fmt.Errorf("failed to check procedure registry for %s: %w", proc.FullName, err)
+		}
 		
 		if existingCount > 0 {
 			// Already migrated this exact version
