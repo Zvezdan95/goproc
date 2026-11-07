@@ -528,4 +528,184 @@ func ShortDeclProc(ctx context.Context) (ResultStruct, error) {
 	}
 }
 
+func TestRecursiveInliningAndLoopFixes(t *testing.T) {
+	src := `package testpkg
+
+import (
+	"context"
+	"github.com/user/gormproc"
+	"gorm.io/gorm"
+)
+
+type RoundSummary struct {
+	FinalBalance float64
+	Processed    int64
+}
+
+type ExtSubProcs struct {
+	gormproc.BaseService
+}
+
+//gorm:proc pokermem.TriggerWinnerFeed2
+func (e *ExtSubProcs) TriggerWinnerFeed2(userID int64, amount float64) error {
+	return nil
+}
+
+type LeafTaxCalculator interface {
+	ComputeNet(gross float64) float64
+}
+
+type flatTaxCalc struct {
+	rate float64
+}
+
+func (c *flatTaxCalc) ComputeNet(gross float64) float64 {
+	if gross <= 0 {
+		return 0
+	}
+	return applyMultiplier(gross, 1.0-c.rate)
+}
+
+func applyMultiplier(v float64, m float64) float64 {
+	return v * m
+}
+
+type AccountRepo interface {
+	CreditPlayer(tx *gorm.DB, userID int64, gross float64, outNewBal *float64) error
+}
+
+type sqlAccountRepo struct {
+	tax LeafTaxCalculator
+}
+
+func (r *sqlAccountRepo) CreditPlayer(tx *gorm.DB, userID int64, gross float64, outNewBal *float64) error {
+	net := r.tax.ComputeNet(gross)
+	return applySqlCredit(tx, userID, net, outNewBal)
+}
+
+func applySqlCredit(tx *gorm.DB, userID int64, net float64, outBal *float64) error {
+	if err := tx.Exec("UPDATE accounts SET balance = IFNULL(balance, 0) + ? WHERE id = ?", net, userID).Error; err != nil {
+		return err
+	}
+	return gormproc.SelectInto(tx, "SELECT IF(balance > 0, balance, 0) FROM accounts WHERE id = ?", userID, outBal)
+}
+
+type UnmarkedHelper struct{}
+
+func (u *UnmarkedHelper) ExecuteStep(tx *gorm.DB, repo AccountRepo, userID int64, amt float64, outBal *float64) error {
+	return repo.CreditPlayer(tx, userID, amt, outBal)
+}
+
+type GameService struct {
+	db  *gorm.DB
+	ext *ExtSubProcs
+}
+
+//gorm:procedure
+func (s *GameService) SettleBatch(ctx context.Context, userID int64, payload gormproc.JSON, stake gormproc.Decimal, count int64) (RoundSummary, error) {
+	var res RoundSummary
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		var bal float64
+		var processed int64
+		var calc LeafTaxCalculator = &flatTaxCalc{rate: 0.1}
+		var repo AccountRepo = &sqlAccountRepo{tax: calc}
+		helper := UnmarkedHelper{}
+
+		var idx int64
+		for idx = 0; idx < count; idx++ {
+			kind := gormproc.FromJsonInt64(payload, "$[0]")
+			switch kind {
+			case 0:
+				continue
+			case 99:
+				break
+			}
+			if kind < 0 {
+				break
+			}
+			if err := helper.ExecuteStep(tx, repo, userID, stake, &bal); err != nil {
+				return err
+			}
+			processed++
+		}
+
+		if err := s.ext.TriggerWinnerFeed2(userID, bal); err != nil {
+			return err
+		}
+
+		res.FinalBalance = bal
+		res.Processed = processed
+		return nil
+	})
+	return res, err
+}
+`
+
+	procs, err := parser.ParseSource(map[string]string{"settle.go": src})
+	if err != nil {
+		t.Fatalf("ParseSource failed: %v", err)
+	}
+	if len(procs) != 1 || procs[0].Name != "SettleBatch" {
+		t.Fatalf("expected exactly 1 procedure (SettleBatch), got %d", len(procs))
+	}
+
+	mySQL, err := ToMySQL(procs[0], "abcd1234")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+
+	// 1. Parameter types: JSON and DECIMAL(65,18) in MySQL
+	if !strings.Contains(mySQL, "IN p_payload JSON, IN p_stake DECIMAL(65,18), IN p_count BIGINT") {
+		t.Errorf("MySQL expected JSON and DECIMAL(65,18) parameter types. Got:\n%s", mySQL)
+	}
+	// 2. Helper functions & unmarked struct/interface methods must be inlined as SQL, NEVER emitted as CALL!
+	for _, forbiddenCall := range []string{"CALL executestep", "CALL creditplayer", "CALL applysqlcredit", "CALL computenet", "CALL applymultiplier"} {
+		if strings.Contains(strings.ToLower(mySQL), strings.ToLower(forbiddenCall)) {
+			t.Errorf("MySQL emitted forbidden helper CALL %q instead of inlining:\n%s", forbiddenCall, mySQL)
+		}
+	}
+	// 3. Inlined SQL & cross-schema CALL present
+	if !strings.Contains(mySQL, "UPDATE accounts SET balance = IFNULL(balance, 0) +") {
+		t.Errorf("MySQL missing inlined UPDATE from deep helper:\n%s", mySQL)
+	}
+	if !strings.Contains(mySQL, "INTO v_bal FROM accounts WHERE id = p_userID;") {
+		t.Errorf("MySQL missing pointer out-param substitution INTO v_bal:\n%s", mySQL)
+	}
+	if !strings.Contains(mySQL, "CALL pokermem.TriggerWinnerFeed2(p_userID, v_bal);") {
+		t.Errorf("MySQL missing schema-qualified external procedure CALL:\n%s", mySQL)
+	}
+	// 4. Loop label, pre-continue increment, ITERATE, and LEAVE
+	if !strings.Contains(mySQL, "loop_1: WHILE v_idx < p_count DO") {
+		t.Errorf("MySQL missing labeled WHILE loop:\n%s", mySQL)
+	}
+	if !strings.Contains(mySQL, "SET v_idx = v_idx + 1;\n\t\t\tITERATE loop_1;") {
+		t.Errorf("MySQL continue did not increment loop counter before ITERATE:\n%s", mySQL)
+	}
+	// Switch break (case 99) must NOT emit LEAVE loop_1, while outer if break (kind < 0) MUST emit LEAVE loop_1
+	if strings.Count(mySQL, "LEAVE loop_1;") != 1 {
+		t.Errorf("MySQL expected exactly 1 LEAVE loop_1 (from outer break, not switch break). Got:\n%s", mySQL)
+	}
+
+	pgSQL, err := ToPostgres(procs[0], "abcd1234")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	// 5. Postgres FUNCTION + RETURNS TABLE + RETURN QUERY + dialect normalization
+	if !strings.Contains(pgSQL, "CREATE OR REPLACE FUNCTION\nsettlebatch_abcd1234(p_userID BIGINT, p_payload TEXT, p_stake NUMERIC, p_count BIGINT)\nRETURNS TABLE(FinalBalance NUMERIC, Processed BIGINT)") {
+		t.Errorf("Postgres missing FUNCTION ... RETURNS TABLE header. Got:\n%s", pgSQL)
+	}
+	if !strings.Contains(pgSQL, "COALESCE(balance, 0)") || !strings.Contains(pgSQL, "(CASE WHEN balance > 0 THEN balance ELSE 0 END)") {
+		t.Errorf("Postgres did not normalize IFNULL / IF(c,a,b) in raw SQL. Got:\n%s", pgSQL)
+	}
+	if !strings.Contains(pgSQL, "v_idx := v_idx + 1;\n\t\t\tCONTINUE loop_1;") {
+		t.Errorf("Postgres continue did not increment loop counter before CONTINUE:\n%s", pgSQL)
+	}
+	if strings.Count(pgSQL, "EXIT loop_1;") != 1 {
+		t.Errorf("Postgres expected exactly 1 EXIT loop_1. Got:\n%s", pgSQL)
+	}
+	if !strings.Contains(pgSQL, "RETURN QUERY SELECT v_FinalBalance AS FinalBalance, v_Processed AS Processed;") {
+		t.Errorf("Postgres missing RETURN QUERY SELECT result projection. Got:\n%s", pgSQL)
+	}
+}
+
 

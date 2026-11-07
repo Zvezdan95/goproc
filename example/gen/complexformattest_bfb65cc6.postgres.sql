@@ -1,5 +1,5 @@
 CREATE OR REPLACE PROCEDURE
-complexformattest_a1e80486(p_action BIGINT, p_data VARCHAR(255))
+complexformattest_bfb65cc6(p_action BIGINT, p_data TEXT)
 LANGUAGE plpgsql AS $$
 #variable_conflict use_variable
 DECLARE

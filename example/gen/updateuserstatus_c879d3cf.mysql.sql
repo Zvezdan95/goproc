@@ -1,4 +1,4 @@
-CREATE PROCEDURE updateuserstatus_22e2f6ef(IN p_userID BIGINT, IN p_isActive BOOLEAN)
+CREATE PROCEDURE updateuserstatus_c879d3cf(IN p_userID BIGINT, IN p_isActive BOOLEAN)
 BEGIN
 	DECLARE v_newStatus TEXT;
 	IF p_isActive THEN

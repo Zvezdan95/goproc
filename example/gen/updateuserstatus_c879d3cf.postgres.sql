@@ -1,7 +1,8 @@
-CREATE OR REPLACE PROCEDURE
-updateuserstatus_22e2f6ef(p_userID BIGINT, p_isActive BOOLEAN)
+CREATE OR REPLACE FUNCTION
+updateuserstatus_c879d3cf(p_userID BIGINT, p_isActive BOOLEAN)
+RETURNS TABLE(status TEXT)
 LANGUAGE plpgsql AS $$
-#variable_conflict use_variable
+#variable_conflict use_column
 DECLARE
 v_newStatus TEXT;
 BEGIN
@@ -11,6 +12,6 @@ BEGIN
 		v_newStatus := 'INACTIVE';
 	END IF;
 	UPDATE users SET status = v_newStatus WHERE id = p_userID;
-	SELECT status FROM users WHERE id = p_userID;
+	RETURN QUERY SELECT status FROM users WHERE id = p_userID;
 END;
 $$;

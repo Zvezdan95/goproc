@@ -11,6 +11,14 @@ import (
 )
 
 func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
+	fn, err := parser.ResolveAndInline(proc)
+	if err != nil {
+		return "", err
+	}
+	if fn == nil {
+		fn = proc.Func
+	}
+
 	var bodyBuf bytes.Buffer
 	var declsBuf bytes.Buffer
 	funcName := fmt.Sprintf("%s_%s", strings.ToLower(proc.Name), hash)
@@ -29,34 +37,11 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 
 	// Extract parameters
 	var params []string
-	if proc.Func.Type.Params != nil {
-		for _, field := range proc.Func.Type.Params.List {
+	if fn.Type.Params != nil {
+		for _, field := range fn.Type.Params.List {
 			for _, name := range field.Names {
 				if name.Name != "ctx" {
-					sqlType := "DOUBLE"
-					if id, ok := field.Type.(*ast.Ident); ok {
-						switch id.Name {
-						case "int64", "uint64", "uint32", "uint":
-							sqlType = "BIGINT"
-						case "int", "int32":
-							sqlType = "INT"
-						case "float64", "float32":
-							sqlType = "DOUBLE"
-						case "bool":
-							sqlType = "BOOLEAN"
-						case "string":
-							sqlType = "VARCHAR(255)"
-						}
-					} else if se, ok := field.Type.(*ast.StarExpr); ok {
-						if id, ok := se.X.(*ast.Ident); ok {
-							switch id.Name {
-							case "int64", "uint64", "uint32":
-								sqlType = "BIGINT"
-							case "string":
-								sqlType = "VARCHAR(255)"
-							}
-						}
-					}
+					sqlType := resolveSQLParamType(field.Type, "mysql")
 					params = append(params, fmt.Sprintf("IN p_%s %s", name.Name, sqlType))
 				}
 			}
@@ -224,6 +209,15 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 					if sel.Sel.Name == "FromJsonInt64" {
 						return "pokermem.FromJson_int64(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
 					}
+					if sel.Sel.Name == "Now" {
+						return "NOW(3)"
+					}
+					if sel.Sel.Name == "JSONArrayAppend" {
+						return "JSON_ARRAY_APPEND(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ", " + extractArg(e.Args[2]) + ")"
+					}
+					if sel.Sel.Name == "JSONMergePreserve" {
+						return "JSON_MERGE_PRESERVE(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
+					}
 				} else if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name != "fmt" {
 					var argStrs []string
 					for _, arg := range e.Args {
@@ -261,32 +255,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		declaredVars[name] = true
 		localVarMap[name] = true
 
-		if star, ok := typeNode.(*ast.StarExpr); ok {
-			typeNode = star.X
-		}
-
-		typ := ""
-		if id, ok := typeNode.(*ast.Ident); ok {
-			switch id.Name {
-			case "int64", "uint64", "uint32", "uint":
-				typ = "BIGINT"
-			case "int", "int32":
-				typ = "INT"
-			case "int16", "uint16":
-				typ = "SMALLINT"
-			case "int8", "uint8", "byte":
-				typ = "TINYINT"
-			case "float64", "float32":
-				typ = "DOUBLE"
-			case "bool":
-				typ = "BOOLEAN"
-			case "string":
-				typ = "TEXT"
-			}
-		}
-		if typ == "" {
-			typ = inferTypeFromExpr(valExpr, name, "mysql")
-		}
+		typ := resolveSQLVarType(typeNode, valExpr, name, "mysql")
 
 		def := ""
 		if valExpr != nil {
@@ -334,8 +303,8 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 	}
 
 	// Pre-collect variable declarations from function body
-	if proc.Func.Body != nil {
-		ast.Inspect(proc.Func.Body, func(n ast.Node) bool {
+	if fn.Body != nil {
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			if gen, ok := n.(*ast.GenDecl); ok && gen.Tok == token.VAR {
 				for _, spec := range gen.Specs {
 					if vSpec, ok := spec.(*ast.ValueSpec); ok {
@@ -365,6 +334,11 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 
 	var resFields []string
 	resFieldSet := make(map[string]bool)
+	var loopStack []loopContext
+	loopSeq := 0
+	inSwitchDepth := 0
+	scalarRetExpr := ""
+
 	var walkStmt func(stmt ast.Stmt)
 	walkStmt = func(stmt ast.Stmt) {
 		switch s := stmt.(type) {
@@ -372,6 +346,13 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 			for _, bs := range s.List {
 				walkStmt(bs)
 			}
+		case *ast.IncDecStmt:
+			op := "+"
+			if s.Tok == token.DEC {
+				op = "-"
+			}
+			target := extractArg(s.X)
+			bodyBuf.WriteString(fmt.Sprintf("SET %s = %s %s 1;\n", target, target, op))
 		case *ast.DeclStmt:
 			if gen, ok := s.Decl.(*ast.GenDecl); ok {
 				for _, spec := range gen.Specs {
@@ -477,6 +458,11 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 								arg2 := extractArg(call.Args[1])
 								bodyBuf.WriteString(fmt.Sprintf("SET %s = pokermem.FromJson_int64(%s, %s);\n", lhs, arg1, arg2))
 								return
+							} else if sel.Sel.Name == "FromJsonInt64Optional" {
+								arg1 := extractArg(call.Args[0])
+								arg2 := extractArg(call.Args[1])
+								bodyBuf.WriteString(fmt.Sprintf("SET %s = pokermem.FromJson_int64_optional(%s, %s);\n", lhs, arg1, arg2))
+								return
 							} else if sel.Sel.Name == "FromJsonDecimalOptionalNullable" {
 								out1 := "v_" + s.Lhs[0].(*ast.Ident).Name
 								out2 := "v_" + s.Lhs[1].(*ast.Ident).Name
@@ -489,38 +475,84 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 					}
 				}
 
-				// Normal assignment
+				// Normal or compound assignment
 				val := extractArg(s.Rhs[0])
-				bodyBuf.WriteString(fmt.Sprintf("SET %s = %s;\n", lhs, val))
+				switch s.Tok {
+				case token.ADD_ASSIGN:
+					bodyBuf.WriteString(fmt.Sprintf("SET %s = %s + (%s);\n", lhs, lhs, val))
+				case token.SUB_ASSIGN:
+					bodyBuf.WriteString(fmt.Sprintf("SET %s = %s - (%s);\n", lhs, lhs, val))
+				case token.MUL_ASSIGN:
+					bodyBuf.WriteString(fmt.Sprintf("SET %s = %s * (%s);\n", lhs, lhs, val))
+				case token.QUO_ASSIGN:
+					bodyBuf.WriteString(fmt.Sprintf("SET %s = %s / (%s);\n", lhs, lhs, val))
+				default:
+					bodyBuf.WriteString(fmt.Sprintf("SET %s = %s;\n", lhs, val))
+				}
 			}
 		case *ast.ForStmt:
-			var loopVar string
 			if initAssign, ok := s.Init.(*ast.AssignStmt); ok {
 				if id, ok := initAssign.Lhs[0].(*ast.Ident); ok {
-					loopVar = "v_" + id.Name
+					loopVar := "v_" + id.Name
 					val := extractArg(initAssign.Rhs[0])
 					bodyBuf.WriteString(fmt.Sprintf("SET %s = %s;\n", loopVar, val))
 				}
 			}
 
-			bodyBuf.WriteString("WHILE " + extractArg(s.Cond))
-			bodyBuf.WriteString(" DO\n")
-
-			walkStmt(s.Body)
-
-			if postAssign, ok := s.Post.(*ast.IncDecStmt); ok {
-				if id, ok := postAssign.X.(*ast.Ident); ok {
-					if op := postAssign.Tok.String()[:1]; op == "+" || op == "-" {
-						bodyBuf.WriteString(fmt.Sprintf("SET v_%s = v_%s %s 1;\n", id.Name, id.Name, op))
+			postSQL := ""
+			if postInc, ok := s.Post.(*ast.IncDecStmt); ok {
+				if id, ok := postInc.X.(*ast.Ident); ok {
+					if op := postInc.Tok.String()[:1]; op == "+" || op == "-" {
+						postSQL = fmt.Sprintf("SET v_%s = v_%s %s 1;\n", id.Name, id.Name, op)
 					}
 				}
+			} else if postAssign, ok := s.Post.(*ast.AssignStmt); ok && len(postAssign.Lhs) > 0 && len(postAssign.Rhs) > 0 {
+				target := extractArg(postAssign.Lhs[0])
+				val := extractArg(postAssign.Rhs[0])
+				switch postAssign.Tok {
+				case token.ADD_ASSIGN:
+					postSQL = fmt.Sprintf("SET %s = %s + (%s);\n", target, target, val)
+				case token.SUB_ASSIGN:
+					postSQL = fmt.Sprintf("SET %s = %s - (%s);\n", target, target, val)
+				default:
+					postSQL = fmt.Sprintf("SET %s = %s;\n", target, val)
+				}
 			}
-			bodyBuf.WriteString("END WHILE;\n")
+
+			needsLabel := hasLoopBranchStmt(s.Body)
+			if needsLabel {
+				loopSeq++
+				label := fmt.Sprintf("loop_%d", loopSeq)
+				loopStack = append(loopStack, loopContext{label: label, postSQL: postSQL})
+				bodyBuf.WriteString(fmt.Sprintf("%s: WHILE %s DO\n", label, extractArg(s.Cond)))
+				walkStmt(s.Body)
+				loopStack = loopStack[:len(loopStack)-1]
+				bodyBuf.WriteString(postSQL)
+				bodyBuf.WriteString(fmt.Sprintf("END WHILE %s;\n", label))
+			} else {
+				bodyBuf.WriteString("WHILE " + extractArg(s.Cond) + " DO\n")
+				walkStmt(s.Body)
+				bodyBuf.WriteString(postSQL)
+				bodyBuf.WriteString("END WHILE;\n")
+			}
+		case *ast.BranchStmt:
+			if s.Tok == token.CONTINUE && len(loopStack) > 0 {
+				top := loopStack[len(loopStack)-1]
+				if top.postSQL != "" {
+					bodyBuf.WriteString(top.postSQL)
+				}
+				bodyBuf.WriteString(fmt.Sprintf("ITERATE %s;\n", top.label))
+			} else if s.Tok == token.BREAK && (inSwitchDepth == 0 || s.Label != nil) && len(loopStack) > 0 {
+				top := loopStack[len(loopStack)-1]
+				bodyBuf.WriteString(fmt.Sprintf("LEAVE %s;\n", top.label))
+			}
 		case *ast.SwitchStmt:
+			inSwitchDepth++
 			tag := extractArg(s.Tag)
 			bodyBuf.WriteString(fmt.Sprintf("CASE %s\n", tag))
 			walkStmt(s.Body)
 			bodyBuf.WriteString("END CASE;\n")
+			inSwitchDepth--
 		case *ast.CaseClause:
 			if len(s.List) > 0 {
 				var conds []string
@@ -581,8 +613,8 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 										}
 										args = append(args, extractArg(arg))
 									}
-									funcName := strings.ToLower(sel.Sel.Name)
-									bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
+									subName := resolveSubProcCallName(proc, call, sel.Sel.Name)
+									bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
 									handledInit = true
 								}
 							} else if id, ok := call.Fun.(*ast.Ident); ok {
@@ -593,8 +625,8 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 									}
 									args = append(args, extractArg(arg))
 								}
-								funcName := strings.ToLower(id.Name)
-								bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
+								subName := resolveSubProcCallName(proc, call, id.Name)
+								bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
 								handledInit = true
 							}
 						}
@@ -624,7 +656,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 			bodyBuf.WriteString("END IF;\n")
 
 		case *ast.ReturnStmt:
-			for _, res := range s.Results {
+			for idx, res := range s.Results {
 				if emitQuery(res) {
 					continue
 				}
@@ -654,6 +686,12 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 								bodyBuf.WriteString(fmt.Sprintf("SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = %s;\n", lit.Value))
 							}
 						}
+						continue
+					}
+				}
+				if idx == 0 && analysis != nil && analysis.ReturnsResult {
+					if id, ok := res.(*ast.Ident); !ok || (id.Name != "res" && id.Name != "nil" && id.Name != "err") {
+						scalarRetExpr = extractArg(res)
 					}
 				}
 			}
@@ -702,8 +740,8 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 							}
 							args = append(args, extractArg(arg))
 						}
-						funcName := strings.ToLower(sel.Sel.Name)
-						bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
+						subName := resolveSubProcCallName(proc, call, sel.Sel.Name)
+						bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
 					}
 				} else if id, ok := call.Fun.(*ast.Ident); ok {
 					args := []string{}
@@ -713,16 +751,16 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 						}
 						args = append(args, extractArg(arg))
 					}
-					funcName := strings.ToLower(id.Name)
-					bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
+					subName := resolveSubProcCallName(proc, call, id.Name)
+					bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
 				}
 			}
 		}
 	}
 
 	// Walk top-level statements, and if a statement is or contains a Transaction call, walk inside it
-	if proc.Func.Body != nil {
-		for _, stmt := range proc.Func.Body.List {
+	if fn.Body != nil {
+		for _, stmt := range fn.Body.List {
 			handledTx := false
 			ast.Inspect(stmt, func(n ast.Node) bool {
 				if call, ok := n.(*ast.CallExpr); ok {
@@ -751,6 +789,8 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 			selectCols = append(selectCols, fmt.Sprintf("v_%s AS %s", field, field))
 		}
 		bodyBuf.WriteString(fmt.Sprintf("SELECT %s;\n", strings.Join(selectCols, ", ")))
+	} else if analysis != nil && analysis.ReturnsResult && !hasEmittedSelect && scalarRetExpr != "" && scalarRetExpr != "NULL" && scalarRetExpr != "''" {
+		bodyBuf.WriteString(fmt.Sprintf("SELECT %s AS result;\n", scalarRetExpr))
 	}
 
 	var finalBuf bytes.Buffer
@@ -790,7 +830,7 @@ func formatSQL(sql string) string {
 
 		formatted = append(formatted, strings.Repeat("\t", currentIndent)+trimmed)
 
-		if strings.HasPrefix(trimmed, "BEGIN") || strings.HasPrefix(trimmed, "IF ") || strings.HasPrefix(trimmed, "WHILE ") || strings.HasPrefix(trimmed, "CASE ") || trimmed == "ELSE" || strings.HasPrefix(trimmed, "WHEN ") || strings.HasPrefix(trimmed, "ELSEIF ") {
+		if strings.HasPrefix(trimmed, "BEGIN") || strings.HasPrefix(trimmed, "IF ") || strings.HasPrefix(trimmed, "WHILE ") || (strings.Contains(trimmed, ": WHILE ") && strings.HasSuffix(trimmed, " DO")) || strings.HasPrefix(trimmed, "CASE ") || trimmed == "ELSE" || strings.HasPrefix(trimmed, "WHEN ") || strings.HasPrefix(trimmed, "ELSEIF ") {
 			indent = currentIndent + 1
 		}
 		if strings.HasPrefix(trimmed, "END") {

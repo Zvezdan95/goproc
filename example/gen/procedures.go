@@ -27,97 +27,113 @@ func NewProcedures(db *gorm.DB) Procedures {
 
 func (p *gormProcedures) ProcessBilling(ctx context.Context, userID int64, amount float64) (procedures.BillingResult, error) {
 	var result procedures.BillingResult
-	err := p.db.WithContext(ctx).Raw("CALL processbilling_8adc139b(?, ?)", userID, amount).Scan(&result).Error
+	if p.db != nil && p.db.Dialector != nil && p.db.Dialector.Name() == "postgres" {
+		err := p.db.WithContext(ctx).Raw("SELECT * FROM processbilling_9587f7c3(?, ?)", userID, amount).Scan(&result).Error
+		return result, err
+	}
+	err := p.db.WithContext(ctx).Raw("CALL processbilling_9587f7c3(?, ?)", userID, amount).Scan(&result).Error
 	return result, err
 }
 
 func (p *gormProcedures) ComplexFormatTest(ctx context.Context, action int64, data string) error {
-	err := p.db.WithContext(ctx).Exec("CALL complexformattest_a1e80486(?, ?)", action, data).Error
+	err := p.db.WithContext(ctx).Exec("CALL complexformattest_bfb65cc6(?, ?)", action, data).Error
 	return err
 }
 
 func (p *gormProcedures) UpdateUserStatus(ctx context.Context, userID int64, isActive bool) (procedures.UserStatusResult, error) {
 	var result procedures.UserStatusResult
-	err := p.db.WithContext(ctx).Raw("CALL updateuserstatus_22e2f6ef(?, ?)", userID, isActive).Scan(&result).Error
+	if p.db != nil && p.db.Dialector != nil && p.db.Dialector.Name() == "postgres" {
+		err := p.db.WithContext(ctx).Raw("SELECT * FROM updateuserstatus_c879d3cf(?, ?)", userID, isActive).Scan(&result).Error
+		return result, err
+	}
+	err := p.db.WithContext(ctx).Raw("CALL updateuserstatus_c879d3cf(?, ?)", userID, isActive).Scan(&result).Error
 	return result, err
 }
 
 func (p *gormProcedures) TransferFunds(ctx context.Context, fromID int64, toID int64, amount float64) (bool, error) {
 	var result bool
-	err := p.db.WithContext(ctx).Raw("CALL transferfunds_de53908f(?, ?, ?)", fromID, toID, amount).Scan(&result).Error
+	if p.db != nil && p.db.Dialector != nil && p.db.Dialector.Name() == "postgres" {
+		err := p.db.WithContext(ctx).Raw("SELECT * FROM transferfunds_c4ad3a52(?, ?, ?)", fromID, toID, amount).Scan(&result).Error
+		return result, err
+	}
+	err := p.db.WithContext(ctx).Raw("CALL transferfunds_c4ad3a52(?, ?, ?)", fromID, toID, amount).Scan(&result).Error
 	return result, err
 }
 
 func (p *gormProcedures) GetOptionalData(ctx context.Context, userID int64, defaultNote *string) (procedures.OptionalData, error) {
 	var result procedures.OptionalData
-	err := p.db.WithContext(ctx).Raw("CALL getoptionaldata_4b21c7ef(?, ?)", userID, defaultNote).Scan(&result).Error
+	if p.db != nil && p.db.Dialector != nil && p.db.Dialector.Name() == "postgres" {
+		err := p.db.WithContext(ctx).Raw("SELECT * FROM getoptionaldata_14c6babd(?, ?)", userID, defaultNote).Scan(&result).Error
+		return result, err
+	}
+	err := p.db.WithContext(ctx).Raw("CALL getoptionaldata_14c6babd(?, ?)", userID, defaultNote).Scan(&result).Error
 	return result, err
 }
 
-//go:embed processbilling_8adc139b.postgres.sql
-var sql_processbilling_8adc139b_pg string
+//go:embed processbilling_9587f7c3.postgres.sql
+var sql_processbilling_9587f7c3_pg string
 
-//go:embed processbilling_8adc139b.mysql.sql
-var sql_processbilling_8adc139b_my string
+//go:embed processbilling_9587f7c3.mysql.sql
+var sql_processbilling_9587f7c3_my string
 
-//go:embed complexformattest_a1e80486.postgres.sql
-var sql_complexformattest_a1e80486_pg string
+//go:embed complexformattest_bfb65cc6.postgres.sql
+var sql_complexformattest_bfb65cc6_pg string
 
-//go:embed complexformattest_a1e80486.mysql.sql
-var sql_complexformattest_a1e80486_my string
+//go:embed complexformattest_bfb65cc6.mysql.sql
+var sql_complexformattest_bfb65cc6_my string
 
-//go:embed updateuserstatus_22e2f6ef.postgres.sql
-var sql_updateuserstatus_22e2f6ef_pg string
+//go:embed updateuserstatus_c879d3cf.postgres.sql
+var sql_updateuserstatus_c879d3cf_pg string
 
-//go:embed updateuserstatus_22e2f6ef.mysql.sql
-var sql_updateuserstatus_22e2f6ef_my string
+//go:embed updateuserstatus_c879d3cf.mysql.sql
+var sql_updateuserstatus_c879d3cf_my string
 
-//go:embed transferfunds_de53908f.postgres.sql
-var sql_transferfunds_de53908f_pg string
+//go:embed transferfunds_c4ad3a52.postgres.sql
+var sql_transferfunds_c4ad3a52_pg string
 
-//go:embed transferfunds_de53908f.mysql.sql
-var sql_transferfunds_de53908f_my string
+//go:embed transferfunds_c4ad3a52.mysql.sql
+var sql_transferfunds_c4ad3a52_my string
 
-//go:embed getoptionaldata_4b21c7ef.postgres.sql
-var sql_getoptionaldata_4b21c7ef_pg string
+//go:embed getoptionaldata_14c6babd.postgres.sql
+var sql_getoptionaldata_14c6babd_pg string
 
-//go:embed getoptionaldata_4b21c7ef.mysql.sql
-var sql_getoptionaldata_4b21c7ef_my string
+//go:embed getoptionaldata_14c6babd.mysql.sql
+var sql_getoptionaldata_14c6babd_my string
 
 var RegisteredProcedures = []gormproc.ProcedureMeta{
 	{
 		BaseName:    "processbilling",
-		Hash:        "8adc139b",
-		FullName:    "processbilling_8adc139b",
-		PostgresSQL: sql_processbilling_8adc139b_pg,
-		MySQLSQL:    sql_processbilling_8adc139b_my,
+		Hash:        "9587f7c3",
+		FullName:    "processbilling_9587f7c3",
+		PostgresSQL: sql_processbilling_9587f7c3_pg,
+		MySQLSQL:    sql_processbilling_9587f7c3_my,
 	},
 	{
 		BaseName:    "complexformattest",
-		Hash:        "a1e80486",
-		FullName:    "complexformattest_a1e80486",
-		PostgresSQL: sql_complexformattest_a1e80486_pg,
-		MySQLSQL:    sql_complexformattest_a1e80486_my,
+		Hash:        "bfb65cc6",
+		FullName:    "complexformattest_bfb65cc6",
+		PostgresSQL: sql_complexformattest_bfb65cc6_pg,
+		MySQLSQL:    sql_complexformattest_bfb65cc6_my,
 	},
 	{
 		BaseName:    "updateuserstatus",
-		Hash:        "22e2f6ef",
-		FullName:    "updateuserstatus_22e2f6ef",
-		PostgresSQL: sql_updateuserstatus_22e2f6ef_pg,
-		MySQLSQL:    sql_updateuserstatus_22e2f6ef_my,
+		Hash:        "c879d3cf",
+		FullName:    "updateuserstatus_c879d3cf",
+		PostgresSQL: sql_updateuserstatus_c879d3cf_pg,
+		MySQLSQL:    sql_updateuserstatus_c879d3cf_my,
 	},
 	{
 		BaseName:    "transferfunds",
-		Hash:        "de53908f",
-		FullName:    "transferfunds_de53908f",
-		PostgresSQL: sql_transferfunds_de53908f_pg,
-		MySQLSQL:    sql_transferfunds_de53908f_my,
+		Hash:        "c4ad3a52",
+		FullName:    "transferfunds_c4ad3a52",
+		PostgresSQL: sql_transferfunds_c4ad3a52_pg,
+		MySQLSQL:    sql_transferfunds_c4ad3a52_my,
 	},
 	{
 		BaseName:    "getoptionaldata",
-		Hash:        "4b21c7ef",
-		FullName:    "getoptionaldata_4b21c7ef",
-		PostgresSQL: sql_getoptionaldata_4b21c7ef_pg,
-		MySQLSQL:    sql_getoptionaldata_4b21c7ef_my,
+		Hash:        "14c6babd",
+		FullName:    "getoptionaldata_14c6babd",
+		PostgresSQL: sql_getoptionaldata_14c6babd_pg,
+		MySQLSQL:    sql_getoptionaldata_14c6babd_my,
 	},
 }

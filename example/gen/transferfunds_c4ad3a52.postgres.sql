@@ -1,7 +1,8 @@
-CREATE OR REPLACE PROCEDURE
-transferfunds_de53908f(p_fromID BIGINT, p_toID BIGINT, p_amount NUMERIC)
+CREATE OR REPLACE FUNCTION
+transferfunds_c4ad3a52(p_fromID BIGINT, p_toID BIGINT, p_amount NUMERIC)
+RETURNS TABLE(result BOOLEAN)
 LANGUAGE plpgsql AS $$
-#variable_conflict use_variable
+#variable_conflict use_column
 DECLARE
 v_success BOOLEAN;
 BEGIN
@@ -14,5 +15,6 @@ BEGIN
 	UPDATE accounts SET balance = balance - p_amount WHERE id = p_fromID;
 	UPDATE accounts SET balance = balance + p_amount WHERE id = p_toID;
 	v_success := TRUE;
+	RETURN QUERY SELECT v_success AS result;
 END;
 $$;

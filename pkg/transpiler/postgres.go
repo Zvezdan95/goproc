@@ -11,6 +11,14 @@ import (
 )
 
 func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
+	fn, err := parser.ResolveAndInline(proc)
+	if err != nil {
+		return "", err
+	}
+	if fn == nil {
+		fn = proc.Func
+	}
+
 	var bodyBuf bytes.Buffer
 	var varDecls bytes.Buffer
 	funcName := fmt.Sprintf("%s_%s", strings.ToLower(proc.Name), hash)
@@ -29,34 +37,11 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 
 	// Extract parameters
 	var params []string
-	if proc.Func.Type.Params != nil {
-		for _, field := range proc.Func.Type.Params.List {
+	if fn.Type.Params != nil {
+		for _, field := range fn.Type.Params.List {
 			for _, name := range field.Names {
 				if name.Name != "ctx" {
-					sqlType := "NUMERIC"
-					if id, ok := field.Type.(*ast.Ident); ok {
-						switch id.Name {
-						case "int64", "uint64", "uint32", "uint":
-							sqlType = "BIGINT"
-						case "int", "int32":
-							sqlType = "INTEGER"
-						case "float64", "float32":
-							sqlType = "NUMERIC"
-						case "bool":
-							sqlType = "BOOLEAN"
-						case "string":
-							sqlType = "VARCHAR(255)"
-						}
-					} else if se, ok := field.Type.(*ast.StarExpr); ok {
-						if id, ok := se.X.(*ast.Ident); ok {
-							switch id.Name {
-							case "int64", "uint64", "uint32":
-								sqlType = "BIGINT"
-							case "string":
-								sqlType = "VARCHAR(255)"
-							}
-						}
-					}
+					sqlType := resolveSQLParamType(field.Type, "postgres")
 					params = append(params, fmt.Sprintf("p_%s %s", name.Name, sqlType))
 				}
 			}
@@ -223,6 +208,15 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 					if sel.Sel.Name == "FromJsonInt64" {
 						return "pokermem.FromJson_int64(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
 					}
+					if sel.Sel.Name == "Now" {
+						return "CURRENT_TIMESTAMP::TEXT"
+					}
+					if sel.Sel.Name == "JSONArrayAppend" {
+						return "((" + extractArg(e.Args[0]) + ")::jsonb || to_jsonb(" + extractArg(e.Args[2]) + "))::text"
+					}
+					if sel.Sel.Name == "JSONMergePreserve" {
+						return "((" + extractArg(e.Args[0]) + ")::jsonb || (" + extractArg(e.Args[1]) + ")::jsonb)::text"
+					}
 				} else if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name != "fmt" {
 					var argStrs []string
 					for _, arg := range e.Args {
@@ -253,6 +247,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 	}
 
 	declaredVars := make(map[string]bool)
+	resVarTypes := make(map[string]string)
 	declareVar := func(name string, typeNode ast.Expr, valExpr ast.Expr) {
 		if declaredVars[name] || name == "res" || name == "err" || name == "_" {
 			return
@@ -260,32 +255,8 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 		declaredVars[name] = true
 		localVarMap[name] = true
 
-		if star, ok := typeNode.(*ast.StarExpr); ok {
-			typeNode = star.X
-		}
-
-		typ := ""
-		if id, ok := typeNode.(*ast.Ident); ok {
-			switch id.Name {
-			case "int64", "uint64", "uint32", "uint":
-				typ = "BIGINT"
-			case "int", "int32":
-				typ = "INTEGER"
-			case "int16", "uint16":
-				typ = "SMALLINT"
-			case "int8", "uint8", "byte":
-				typ = "SMALLINT"
-			case "float64", "float32":
-				typ = "NUMERIC"
-			case "bool":
-				typ = "BOOLEAN"
-			case "string":
-				typ = "TEXT"
-			}
-		}
-		if typ == "" {
-			typ = inferTypeFromExpr(valExpr, name, "postgres")
-		}
+		typ := resolveSQLVarType(typeNode, valExpr, name, "postgres")
+		resVarTypes[name] = typ
 
 		def := ""
 		if valExpr != nil {
@@ -316,14 +287,16 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && (sel.Sel.Name == "Exec" || sel.Sel.Name == "Raw") {
 			if len(call.Args) > 0 {
 				if lit, ok := call.Args[0].(*ast.BasicLit); ok {
-					query := strings.Trim(lit.Value, "`\"")
+					query := normalizeQueryForPostgres(strings.Trim(lit.Value, "`\""))
 					for i := 1; i < len(call.Args); i++ {
 						query = strings.Replace(query, "?", extractArg(call.Args[i]), 1)
 					}
-					bodyBuf.WriteString(query + ";\n")
 					queryUpper := strings.ToUpper(strings.TrimSpace(query))
 					if strings.HasPrefix(queryUpper, "SELECT") {
+						bodyBuf.WriteString("RETURN QUERY " + strings.TrimSpace(query) + ";\n")
 						hasEmittedSelect = true
+					} else {
+						bodyBuf.WriteString(query + ";\n")
 					}
 					return true
 				}
@@ -333,8 +306,8 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 	}
 
 	// Pre-collect variable declarations from function body
-	if proc.Func.Body != nil {
-		ast.Inspect(proc.Func.Body, func(n ast.Node) bool {
+	if fn.Body != nil {
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			if gen, ok := n.(*ast.GenDecl); ok && gen.Tok == token.VAR {
 				for _, spec := range gen.Specs {
 					if vSpec, ok := spec.(*ast.ValueSpec); ok {
@@ -364,6 +337,11 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 
 	var resFields []string
 	resFieldSet := make(map[string]bool)
+	var loopStack []loopContext
+	loopSeq := 0
+	inSwitchDepth := 0
+	scalarRetExpr := ""
+
 	var walkStmt func(stmt ast.Stmt)
 	walkStmt = func(stmt ast.Stmt) {
 		switch s := stmt.(type) {
@@ -371,6 +349,13 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 			for _, bs := range s.List {
 				walkStmt(bs)
 			}
+		case *ast.IncDecStmt:
+			op := "+"
+			if s.Tok == token.DEC {
+				op = "-"
+			}
+			target := extractArg(s.X)
+			bodyBuf.WriteString(fmt.Sprintf("%s := %s %s 1;\n", target, target, op))
 		case *ast.DeclStmt:
 			if gen, ok := s.Decl.(*ast.GenDecl); ok {
 				for _, spec := range gen.Specs {
@@ -475,6 +460,11 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 								arg2 := extractArg(call.Args[1])
 								bodyBuf.WriteString(fmt.Sprintf("%s := pokermem.FromJson_int64(%s, %s);\n", lhs, arg1, arg2))
 								return
+							} else if sel.Sel.Name == "FromJsonInt64Optional" {
+								arg1 := extractArg(call.Args[0])
+								arg2 := extractArg(call.Args[1])
+								bodyBuf.WriteString(fmt.Sprintf("%s := pokermem.FromJson_int64_optional(%s, %s);\n", lhs, arg1, arg2))
+								return
 							} else if sel.Sel.Name == "FromJsonDecimalOptionalNullable" {
 								out1 := "v_" + s.Lhs[0].(*ast.Ident).Name
 								out2 := "v_" + s.Lhs[1].(*ast.Ident).Name
@@ -487,38 +477,84 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 					}
 				}
 
-				// Normal assignment
+				// Normal or compound assignment
 				val := extractArg(s.Rhs[0])
-				bodyBuf.WriteString(fmt.Sprintf("%s := %s;\n", lhs, val))
+				switch s.Tok {
+				case token.ADD_ASSIGN:
+					bodyBuf.WriteString(fmt.Sprintf("%s := %s + (%s);\n", lhs, lhs, val))
+				case token.SUB_ASSIGN:
+					bodyBuf.WriteString(fmt.Sprintf("%s := %s - (%s);\n", lhs, lhs, val))
+				case token.MUL_ASSIGN:
+					bodyBuf.WriteString(fmt.Sprintf("%s := %s * (%s);\n", lhs, lhs, val))
+				case token.QUO_ASSIGN:
+					bodyBuf.WriteString(fmt.Sprintf("%s := %s / (%s);\n", lhs, lhs, val))
+				default:
+					bodyBuf.WriteString(fmt.Sprintf("%s := %s;\n", lhs, val))
+				}
 			}
 		case *ast.ForStmt:
-			var loopVar string
 			if initAssign, ok := s.Init.(*ast.AssignStmt); ok {
 				if id, ok := initAssign.Lhs[0].(*ast.Ident); ok {
-					loopVar = "v_" + id.Name
+					loopVar := "v_" + id.Name
 					val := extractArg(initAssign.Rhs[0])
 					bodyBuf.WriteString(fmt.Sprintf("%s := %s;\n", loopVar, val))
 				}
 			}
 
-			bodyBuf.WriteString("WHILE " + extractArg(s.Cond))
-			bodyBuf.WriteString(" LOOP\n")
-
-			walkStmt(s.Body)
-
-			if postAssign, ok := s.Post.(*ast.IncDecStmt); ok {
-				if id, ok := postAssign.X.(*ast.Ident); ok {
-					if op := postAssign.Tok.String()[:1]; op == "+" || op == "-" {
-						bodyBuf.WriteString(fmt.Sprintf("v_%s := v_%s %s 1;\n", id.Name, id.Name, op))
+			postSQL := ""
+			if postInc, ok := s.Post.(*ast.IncDecStmt); ok {
+				if id, ok := postInc.X.(*ast.Ident); ok {
+					if op := postInc.Tok.String()[:1]; op == "+" || op == "-" {
+						postSQL = fmt.Sprintf("v_%s := v_%s %s 1;\n", id.Name, id.Name, op)
 					}
 				}
+			} else if postAssign, ok := s.Post.(*ast.AssignStmt); ok && len(postAssign.Lhs) > 0 && len(postAssign.Rhs) > 0 {
+				target := extractArg(postAssign.Lhs[0])
+				val := extractArg(postAssign.Rhs[0])
+				switch postAssign.Tok {
+				case token.ADD_ASSIGN:
+					postSQL = fmt.Sprintf("%s := %s + (%s);\n", target, target, val)
+				case token.SUB_ASSIGN:
+					postSQL = fmt.Sprintf("%s := %s - (%s);\n", target, target, val)
+				default:
+					postSQL = fmt.Sprintf("%s := %s;\n", target, val)
+				}
 			}
-			bodyBuf.WriteString("END LOOP;\n")
+
+			needsLabel := hasLoopBranchStmt(s.Body)
+			if needsLabel {
+				loopSeq++
+				label := fmt.Sprintf("loop_%d", loopSeq)
+				loopStack = append(loopStack, loopContext{label: label, postSQL: postSQL})
+				bodyBuf.WriteString(fmt.Sprintf("<<%s>>\nWHILE %s LOOP\n", label, extractArg(s.Cond)))
+				walkStmt(s.Body)
+				loopStack = loopStack[:len(loopStack)-1]
+				bodyBuf.WriteString(postSQL)
+				bodyBuf.WriteString(fmt.Sprintf("END LOOP %s;\n", label))
+			} else {
+				bodyBuf.WriteString("WHILE " + extractArg(s.Cond) + " LOOP\n")
+				walkStmt(s.Body)
+				bodyBuf.WriteString(postSQL)
+				bodyBuf.WriteString("END LOOP;\n")
+			}
+		case *ast.BranchStmt:
+			if s.Tok == token.CONTINUE && len(loopStack) > 0 {
+				top := loopStack[len(loopStack)-1]
+				if top.postSQL != "" {
+					bodyBuf.WriteString(top.postSQL)
+				}
+				bodyBuf.WriteString(fmt.Sprintf("CONTINUE %s;\n", top.label))
+			} else if s.Tok == token.BREAK && (inSwitchDepth == 0 || s.Label != nil) && len(loopStack) > 0 {
+				top := loopStack[len(loopStack)-1]
+				bodyBuf.WriteString(fmt.Sprintf("EXIT %s;\n", top.label))
+			}
 		case *ast.SwitchStmt:
+			inSwitchDepth++
 			tag := extractArg(s.Tag)
 			bodyBuf.WriteString(fmt.Sprintf("CASE %s\n", tag))
 			walkStmt(s.Body)
 			bodyBuf.WriteString("END CASE;\n")
+			inSwitchDepth--
 		case *ast.CaseClause:
 			if len(s.List) > 0 {
 				var conds []string
@@ -544,7 +580,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 								if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name == "gormproc" && sel.Sel.Name == "SelectInto" {
 									if len(call.Args) >= 2 {
 										if queryLit, ok := call.Args[1].(*ast.BasicLit); ok {
-											query := strings.Trim(queryLit.Value, "`\"")
+											query := normalizeQueryForPostgres(strings.Trim(queryLit.Value, "`\""))
 											query = strings.ReplaceAll(query, "\n", " ")
 											query = strings.ReplaceAll(query, "\t", " ")
 
@@ -556,21 +592,21 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 												query = strings.Replace(query, "?", extractArg(inArg), 1)
 											}
 
-												idxFrom := findTopLevelFrom(query)
-												if idxFrom != -1 {
-													selectPart := query[:idxFrom]
-													fromPart := query[idxFrom:]
+											idxFrom := findTopLevelFrom(query)
+											if idxFrom != -1 {
+												selectPart := query[:idxFrom]
+												fromPart := query[idxFrom:]
 
-													var outs []string
-													for _, outArg := range outArgs {
-														outs = append(outs, extractArg(outArg))
-													}
-
-													bodyBuf.WriteString(fmt.Sprintf("%s INTO %s %s;\n", strings.TrimSpace(selectPart), strings.Join(outs, ", "), strings.TrimSpace(fromPart)))
-													handledInit = true
+												var outs []string
+												for _, outArg := range outArgs {
+													outs = append(outs, extractArg(outArg))
 												}
+
+												bodyBuf.WriteString(fmt.Sprintf("%s INTO %s %s;\n", strings.TrimSpace(selectPart), strings.Join(outs, ", "), strings.TrimSpace(fromPart)))
+												handledInit = true
 											}
 										}
+									}
 								} else {
 									args := []string{}
 									for _, arg := range call.Args {
@@ -579,8 +615,8 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 										}
 										args = append(args, extractArg(arg))
 									}
-									funcName := strings.ToLower(sel.Sel.Name)
-									bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
+									subName := resolveSubProcCallName(proc, call, sel.Sel.Name)
+									bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
 									handledInit = true
 								}
 							} else if id, ok := call.Fun.(*ast.Ident); ok {
@@ -591,8 +627,8 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 									}
 									args = append(args, extractArg(arg))
 								}
-								funcName := strings.ToLower(id.Name)
-								bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
+								subName := resolveSubProcCallName(proc, call, id.Name)
+								bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
 								handledInit = true
 							}
 						}
@@ -622,7 +658,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 			bodyBuf.WriteString("END IF;\n")
 
 		case *ast.ReturnStmt:
-			for _, res := range s.Results {
+			for idx, res := range s.Results {
 				if emitQuery(res) {
 					continue
 				}
@@ -653,6 +689,12 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 								bodyBuf.WriteString(fmt.Sprintf("RAISE EXCEPTION '%s';\n", msg))
 							}
 						}
+						continue
+					}
+				}
+				if idx == 0 && analysis != nil && analysis.ReturnsResult {
+					if id, ok := res.(*ast.Ident); !ok || (id.Name != "res" && id.Name != "nil" && id.Name != "err") {
+						scalarRetExpr = extractArg(res)
 					}
 				}
 			}
@@ -666,7 +708,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 						if sel.Sel.Name == "SelectInto" {
 							if len(call.Args) >= 2 {
 								if queryLit, ok := call.Args[1].(*ast.BasicLit); ok {
-									query := strings.Trim(queryLit.Value, "`\"")
+									query := normalizeQueryForPostgres(strings.Trim(queryLit.Value, "`\""))
 									query = strings.ReplaceAll(query, "\n", " ")
 									query = strings.ReplaceAll(query, "\t", " ")
 
@@ -701,8 +743,8 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 							}
 							args = append(args, extractArg(arg))
 						}
-						funcName := strings.ToLower(sel.Sel.Name)
-						bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
+						subName := resolveSubProcCallName(proc, call, sel.Sel.Name)
+						bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
 					}
 				} else if id, ok := call.Fun.(*ast.Ident); ok {
 					args := []string{}
@@ -712,16 +754,16 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 						}
 						args = append(args, extractArg(arg))
 					}
-					funcName := strings.ToLower(id.Name)
-					bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", funcName, strings.Join(args, ", ")))
+					subName := resolveSubProcCallName(proc, call, id.Name)
+					bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
 				}
 			}
 		}
 	}
 
 	// Walk top-level statements, and if a statement is or contains a Transaction call, walk inside it
-	if proc.Func.Body != nil {
-		for _, stmt := range proc.Func.Body.List {
+	if fn.Body != nil {
+		for _, stmt := range fn.Body.List {
 			handledTx := false
 			ast.Inspect(stmt, func(n ast.Node) bool {
 				if call, ok := n.(*ast.CallExpr); ok {
@@ -743,17 +785,34 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 	}
 
 	// If struct fields were assigned (e.g. res.RoundID = ...) and no terminating SELECT query was emitted,
-	// emit the result projection SELECT statement so GORM Raw().Scan() receives the row.
+	// emit the result projection RETURN QUERY SELECT statement so PostgreSQL returns the row cleanly.
 	if len(resFields) > 0 && !hasEmittedSelect {
 		var selectCols []string
 		for _, field := range resFields {
 			selectCols = append(selectCols, fmt.Sprintf("v_%s AS %s", field, field))
 		}
-		bodyBuf.WriteString(fmt.Sprintf("SELECT %s;\n", strings.Join(selectCols, ", ")))
+		bodyBuf.WriteString(fmt.Sprintf("RETURN QUERY SELECT %s;\n", strings.Join(selectCols, ", ")))
+		hasEmittedSelect = true
+	} else if analysis != nil && analysis.ReturnsResult && !hasEmittedSelect && scalarRetExpr != "" && scalarRetExpr != "NULL" && scalarRetExpr != "''" {
+		bodyBuf.WriteString(fmt.Sprintf("RETURN QUERY SELECT %s AS result;\n", scalarRetExpr))
+		hasEmittedSelect = true
 	}
 
 	var finalBuf bytes.Buffer
-	finalBuf.WriteString(fmt.Sprintf("CREATE OR REPLACE PROCEDURE\n%s(%s)\nLANGUAGE plpgsql AS $$\n#variable_conflict use_variable\n", funcName, strings.Join(params, ", ")))
+	retCols := extractPostgresReturnColumns(proc, resFields, resVarTypes)
+	if (analysis != nil && analysis.ReturnsResult) && (len(retCols) > 0 || hasEmittedSelect) {
+		if len(retCols) > 0 {
+			var colSpecs []string
+			for _, rc := range retCols {
+				colSpecs = append(colSpecs, fmt.Sprintf("%s %s", rc.name, rc.sqlType))
+			}
+			finalBuf.WriteString(fmt.Sprintf("CREATE OR REPLACE FUNCTION\n%s(%s)\nRETURNS TABLE(%s)\nLANGUAGE plpgsql AS $$\n#variable_conflict use_column\n", funcName, strings.Join(params, ", "), strings.Join(colSpecs, ", ")))
+		} else {
+			finalBuf.WriteString(fmt.Sprintf("CREATE OR REPLACE FUNCTION\n%s(%s)\nRETURNS SETOF RECORD\nLANGUAGE plpgsql AS $$\n#variable_conflict use_column\n", funcName, strings.Join(params, ", ")))
+		}
+	} else {
+		finalBuf.WriteString(fmt.Sprintf("CREATE OR REPLACE PROCEDURE\n%s(%s)\nLANGUAGE plpgsql AS $$\n#variable_conflict use_variable\n", funcName, strings.Join(params, ", ")))
+	}
 	if varDecls.Len() > 0 {
 		finalBuf.WriteString("DECLARE\n")
 		finalBuf.WriteString(varDecls.String())

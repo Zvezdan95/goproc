@@ -1,4 +1,4 @@
-CREATE PROCEDURE complexformattest_a1e80486(IN p_action BIGINT, IN p_data VARCHAR(255))
+CREATE PROCEDURE complexformattest_bfb65cc6(IN p_action BIGINT, IN p_data TEXT)
 BEGIN
 	DECLARE v_status TEXT;
 	DECLARE v_i BIGINT;

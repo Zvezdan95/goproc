@@ -127,10 +127,13 @@ func GenerateCode(pkgPath string, procs []GeneratedProc) ([]byte, error) {
 		qMarksStr := strings.Join(qMarks, ", ")
 
 		callStmt := ""
+		selectStmt := ""
 		if len(argNames) > 0 {
 			callStmt = fmt.Sprintf("\"CALL %s(%s)\", %s", funcName, qMarksStr, callArgs)
+			selectStmt = fmt.Sprintf("\"SELECT * FROM %s(%s)\", %s", funcName, qMarksStr, callArgs)
 		} else {
 			callStmt = fmt.Sprintf("\"CALL %s()\"", funcName)
+			selectStmt = fmt.Sprintf("\"SELECT * FROM %s()\"", funcName)
 		}
 
 		if len(results) == 1 && results[0] == "error" {
@@ -139,6 +142,10 @@ func GenerateCode(pkgPath string, procs []GeneratedProc) ([]byte, error) {
 		} else if len(results) == 2 && results[len(results)-1] == "error" {
 			resType := results[0]
 			buf.WriteString(fmt.Sprintf("\tvar result %s\n", resType))
+			buf.WriteString("\tif p.db != nil && p.db.Dialector != nil && p.db.Dialector.Name() == \"postgres\" {\n")
+			buf.WriteString(fmt.Sprintf("\t\terr := p.db.WithContext(ctx).Raw(%s).Scan(&result).Error\n", selectStmt))
+			buf.WriteString("\t\treturn result, err\n")
+			buf.WriteString("\t}\n")
 			buf.WriteString(fmt.Sprintf("\terr := p.db.WithContext(ctx).Raw(%s).Scan(&result).Error\n", callStmt))
 			buf.WriteString("\treturn result, err\n")
 		} else if len(results) > 2 && results[len(results)-1] == "error" {
@@ -148,6 +155,18 @@ func GenerateCode(pkgPath string, procs []GeneratedProc) ([]byte, error) {
 				buf.WriteString(fmt.Sprintf("\tvar %s %s\n", vName, results[i]))
 				varNames = append(varNames, vName)
 			}
+			buf.WriteString("\tif p.db != nil && p.db.Dialector != nil && p.db.Dialector.Name() == \"postgres\" {\n")
+			buf.WriteString(fmt.Sprintf("\t\trows, err := p.db.WithContext(ctx).Raw(%s).Rows()\n", selectStmt))
+			buf.WriteString(fmt.Sprintf("\t\tif err != nil {\n\t\t\treturn %s, err\n\t\t}\n", strings.Join(varNames, ", ")))
+			buf.WriteString("\t\tdefer rows.Close()\n")
+			buf.WriteString(fmt.Sprintf("\t\terr = p.db.ScanRows(rows, &%s)\n", varNames[0]))
+			for i := 1; i < len(varNames); i++ {
+				buf.WriteString("\t\tif rows.NextResultSet() {\n")
+				buf.WriteString(fmt.Sprintf("\t\t\t_ = p.db.ScanRows(rows, &%s)\n", varNames[i]))
+				buf.WriteString("\t\t}\n")
+			}
+			buf.WriteString(fmt.Sprintf("\t\treturn %s, err\n", strings.Join(varNames, ", ")))
+			buf.WriteString("\t}\n")
 			buf.WriteString(fmt.Sprintf("\trows, err := p.db.WithContext(ctx).Raw(%s).Rows()\n", callStmt))
 			buf.WriteString(fmt.Sprintf("\tif err != nil {\n\t\treturn %s, err\n\t}\n", strings.Join(varNames, ", ")))
 			buf.WriteString("\tdefer rows.Close()\n")

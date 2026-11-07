@@ -1,4 +1,4 @@
-CREATE PROCEDURE transferfunds_de53908f(IN p_fromID BIGINT, IN p_toID BIGINT, IN p_amount DOUBLE)
+CREATE PROCEDURE transferfunds_c4ad3a52(IN p_fromID BIGINT, IN p_toID BIGINT, IN p_amount DOUBLE)
 BEGIN
 	DECLARE v_success BOOLEAN;
 	IF p_amount <= 0 THEN
@@ -10,4 +10,5 @@ BEGIN
 	UPDATE accounts SET balance = balance - p_amount WHERE id = p_fromID;
 	UPDATE accounts SET balance = balance + p_amount WHERE id = p_toID;
 	SET v_success = 1;
+	SELECT v_success AS result;
 END;

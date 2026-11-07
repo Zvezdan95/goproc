@@ -23,10 +23,14 @@ func AnalyzeCallGraph(proc *parser.Procedure) (*CallGraphAnalyzer, error) {
 		Proc: proc,
 	}
 
-	// Simple MVP analysis
+	fn := proc.EffectiveFunc()
+	if fn == nil {
+		return analyzer, nil
+	}
+
 	// 1. Analyze parameters
-	if proc.Func.Type.Params != nil {
-		for _, field := range proc.Func.Type.Params.List {
+	if fn.Type.Params != nil {
+		for _, field := range fn.Type.Params.List {
 			for _, name := range field.Names {
 				analyzer.Parameters = append(analyzer.Parameters, name.Name)
 			}
@@ -34,21 +38,26 @@ func AnalyzeCallGraph(proc *parser.Procedure) (*CallGraphAnalyzer, error) {
 	}
 
 	// 2. Analyze returns
-	if proc.Func.Type.Results != nil {
-		for _, field := range proc.Func.Type.Results.List {
-			// Typically (ResultType, error)
-			// Simplification for MVP
-			if len(field.Names) > 0 {
+	if fn.Type.Results != nil {
+		resList := fn.Type.Results.List
+		if len(resList) > 1 {
+			analyzer.ReturnsResult = true
+		} else if len(resList) == 1 {
+			if id, ok := resList[0].Type.(*ast.Ident); ok && id.Name == "error" {
+				analyzer.ReturnsError = true
+			} else {
 				analyzer.ReturnsResult = true
 			}
 		}
-		if len(proc.Func.Type.Results.List) > 1 {
-			analyzer.ReturnsResult = true
+		if len(resList) >= 1 {
+			if id, ok := resList[len(resList)-1].Type.(*ast.Ident); ok && id.Name == "error" {
+				analyzer.ReturnsError = true
+			}
 		}
 	}
 
 	// 3. Find Transaction blocks and local vars
-	ast.Inspect(proc.Func, func(n ast.Node) bool {
+	ast.Inspect(fn, func(n ast.Node) bool {
 		switch node := n.(type) {
 		case *ast.CallExpr:
 			if sel, ok := node.Fun.(*ast.SelectorExpr); ok {
