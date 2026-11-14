@@ -36,6 +36,7 @@ type Procedure struct {
 	Name              string
 	Func              *ast.FuncDecl
 	InlinedFunc       *ast.FuncDecl
+	File              *ast.File
 	Type              *types.Signature
 	Obj               *types.Func
 	Pkg               *packages.Package
@@ -184,6 +185,7 @@ func ParseDir(dir string) ([]*Procedure, error) {
 					procedures = append(procedures, &Procedure{
 						Name:              funcDecl.Name.Name,
 						Func:              funcDecl,
+						File:              file,
 						Type:              sig,
 						Obj:               obj,
 						Pkg:               pkg,
@@ -323,6 +325,7 @@ func ParseSource(files map[string]string) ([]*Procedure, error) {
 				procedures = append(procedures, &Procedure{
 					Name:              fd.Name.Name,
 					Func:              fd,
+					File:              file,
 					Type:              sig,
 					Obj:               fnObj,
 					Pkg:               pkg,
@@ -352,7 +355,7 @@ func HasGormProcedureComment(doc *ast.CommentGroup) bool {
 	return false
 }
 
-// ExtractExternalProcName extracts an optional SQL procedure name from //gorm:proc <name>.
+// ExtractExternalProcName extracts an optional SQL procedure or function name from //gorm:proc <name> or //gorm:func <name>.
 func ExtractExternalProcName(doc *ast.CommentGroup) string {
 	if doc == nil {
 		return ""
@@ -361,6 +364,9 @@ func ExtractExternalProcName(doc *ast.CommentGroup) string {
 		text := strings.TrimSpace(comment.Text)
 		if strings.HasPrefix(text, "//gorm:proc ") {
 			return strings.TrimSpace(strings.TrimPrefix(text, "//gorm:proc "))
+		}
+		if strings.HasPrefix(text, "//gorm:func ") {
+			return strings.TrimSpace(strings.TrimPrefix(text, "//gorm:func "))
 		}
 	}
 	return ""

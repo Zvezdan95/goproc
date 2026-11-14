@@ -71,7 +71,7 @@ func TestTranspilers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToPostgres(ComplexFormatTest) failed: %v", err)
 	}
-	if !strings.Contains(pgComplex, "DECLARE") || !strings.Contains(pgComplex, "v_status TEXT;") || !strings.Contains(pgComplex, "v_i BIGINT;") {
+	if !strings.Contains(pgComplex, "DECLARE") || !strings.Contains(pgComplex, "v_status TEXT := '';") || !strings.Contains(pgComplex, "v_i BIGINT := 0;") {
 		t.Errorf("Postgres local variable declarations missing. Got:\n%s", pgComplex)
 	}
 	if !strings.Contains(pgComplex, "WHILE v_i < 5 LOOP") || !strings.Contains(pgComplex, "v_i := v_i + 1;") {
@@ -85,7 +85,7 @@ func TestTranspilers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToMySQL(ComplexFormatTest) failed: %v", err)
 	}
-	if !strings.Contains(myComplex, "DECLARE v_status TEXT;") || !strings.Contains(myComplex, "DECLARE v_i BIGINT;") {
+	if !strings.Contains(myComplex, "DECLARE v_status TEXT DEFAULT '';") || !strings.Contains(myComplex, "DECLARE v_i BIGINT DEFAULT 0;") {
 		t.Errorf("MySQL local variable declarations missing. Got:\n%s", myComplex)
 	}
 	if !strings.Contains(myComplex, "WHILE v_i < 5 DO") || !strings.Contains(myComplex, "SET v_i = v_i + 1;") {
@@ -102,7 +102,7 @@ func TestTranspilers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToPostgres(TransferFunds) failed: %v", err)
 	}
-	if !strings.Contains(pgTransfer, "v_success BOOLEAN;") {
+	if !strings.Contains(pgTransfer, "v_success BOOLEAN := FALSE;") {
 		t.Errorf("Postgres v_success declaration missing. Got:\n%s", pgTransfer)
 	}
 	if !strings.Contains(pgTransfer, "UPDATE accounts SET balance = balance - p_amount WHERE id = p_fromID") ||
@@ -114,7 +114,7 @@ func TestTranspilers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToMySQL(TransferFunds) failed: %v", err)
 	}
-	if !strings.Contains(myTransfer, "DECLARE v_success BOOLEAN;") {
+	if !strings.Contains(myTransfer, "DECLARE v_success BOOLEAN DEFAULT FALSE;") {
 		t.Errorf("MySQL v_success declaration missing. Got:\n%s", myTransfer)
 	}
 	if !strings.Contains(myTransfer, "UPDATE accounts SET balance = balance - p_amount WHERE id = p_fromID") ||
@@ -484,11 +484,11 @@ func PointerVarProc(ctx context.Context) error {
 	if err != nil {
 		t.Fatalf("ToMySQL failed: %v", err)
 	}
-	if !strings.Contains(myPointers, "DECLARE v_bAccID BIGINT;") {
-		t.Errorf("MySQL missing DECLARE v_bAccID BIGINT; for *uint32 pointer. Got:\n%s", myPointers)
+	if !strings.Contains(myPointers, "DECLARE v_bAccID BIGINT DEFAULT 0;") {
+		t.Errorf("MySQL missing DECLARE v_bAccID BIGINT DEFAULT 0; for *uint32 pointer. Got:\n%s", myPointers)
 	}
-	if !strings.Contains(myPointers, "DECLARE v_sMsg TEXT;") {
-		t.Errorf("MySQL missing DECLARE v_sMsg TEXT; for *string pointer. Got:\n%s", myPointers)
+	if !strings.Contains(myPointers, "DECLARE v_sMsg TEXT DEFAULT '';") {
+		t.Errorf("MySQL missing DECLARE v_sMsg TEXT DEFAULT ''; for *string pointer. Got:\n%s", myPointers)
 	}
 
 	// 12. Short variable declaration (:=) and struct pointer assignment (res.BonusAccountID = &bAccID)
@@ -514,7 +514,7 @@ func ShortDeclProc(ctx context.Context) (ResultStruct, error) {
 	if err != nil {
 		t.Fatalf("ToMySQL failed: %v", err)
 	}
-	if !strings.Contains(myShortDecl, "DECLARE v_bAccID BIGINT;") {
+	if !strings.Contains(myShortDecl, "DECLARE v_bAccID BIGINT DEFAULT 0;") {
 		t.Errorf("MySQL missing DECLARE for := variable bAccID. Got:\n%s", myShortDecl)
 	}
 	if !strings.Contains(myShortDecl, "DECLARE v_count BIGINT") {
@@ -523,8 +523,8 @@ func ShortDeclProc(ctx context.Context) (ResultStruct, error) {
 	if !strings.Contains(myShortDecl, "SET v_BonusAccountID = v_bAccID;") {
 		t.Errorf("MySQL missing SET v_BonusAccountID = v_bAccID;. Got:\n%s", myShortDecl)
 	}
-	if !strings.Contains(myShortDecl, "DECLARE v_BonusAccountID BIGINT;") {
-		t.Errorf("MySQL expected DECLARE v_BonusAccountID BIGINT; inferred from &bAccID. Got:\n%s", myShortDecl)
+	if !strings.Contains(myShortDecl, "DECLARE v_BonusAccountID BIGINT DEFAULT 0;") {
+		t.Errorf("MySQL expected DECLARE v_BonusAccountID BIGINT DEFAULT 0; inferred from &bAccID. Got:\n%s", myShortDecl)
 	}
 }
 
@@ -707,5 +707,335 @@ func (s *GameService) SettleBatch(ctx context.Context, userID int64, payload gor
 		t.Errorf("Postgres missing RETURN QUERY SELECT result projection. Got:\n%s", pgSQL)
 	}
 }
+
+func TestExternalFunctionMappingAndZeroValueSemantics(t *testing.T) {
+	src := `package testpkg
+
+import (
+	"context"
+	"github.com/user/gormproc"
+	"gorm.io/gorm"
+)
+
+type ExtSubProc struct {
+	gormproc.BaseService
+}
+
+//gorm:func pokermem.CustomFeeFn
+func (s *ExtSubProc) CustomFeeFn(cgID int64) float64 {
+	return 0
+}
+
+//gorm:func casinodb.StandaloneCalcFn
+func standaloneCalcFn(a float64, b float64) float64 {
+	return 0
+}
+
+type Svc struct {
+	gormproc.BaseService
+	sub *ExtSubProc
+}
+
+//gorm:procedure
+func (s *Svc) CheckRound(ctx context.Context, roundID int64, amount float64) error {
+	var tx *gorm.DB
+	var m_round_id int64
+	var m_amount float64
+	var m_flag bool
+	var m_note string
+
+	if err := gormproc.SelectInto(tx, "SELECT id, amount FROM rounds WHERE id = ?", roundID, &m_round_id, &m_amount); err != nil {
+		return err
+	}
+	if m_round_id == 0 {
+		return nil
+	}
+
+	fee := gormproc.CasinogameFeeCurrent(m_round_id)
+	jp := gormproc.CasinogameCalcJackpotContribution(fee, m_amount)
+	custom := s.sub.CustomFeeFn(m_round_id)
+	ext := standaloneCalcFn(custom, jp)
+
+	tx.Exec("UPDATE rounds SET jp = ? WHERE id = ?", ext, m_round_id)
+	_ = m_flag
+	_ = m_note
+	return nil
+}
+`
+	procs, err := parser.ParseSource(map[string]string{"proc.go": src})
+	if err != nil {
+		t.Fatalf("ParseSource failed: %v", err)
+	}
+	if len(procs) != 1 {
+		t.Fatalf("Expected 1 procedure, got %d", len(procs))
+	}
+
+	mySQL, err := ToMySQL(procs[0], "h1")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	// 1. Exact DB function names
+	if !strings.Contains(mySQL, "pokermem.CasinogameFeeCurrent(v_m_round_id)") {
+		t.Errorf("MySQL expected pokermem.CasinogameFeeCurrent, got:\n%s", mySQL)
+	}
+	if !strings.Contains(mySQL, "casinodb.Casinogame_calcJackpotContribution(v_fee, v_m_amount)") {
+		t.Errorf("MySQL expected casinodb.Casinogame_calcJackpotContribution, got:\n%s", mySQL)
+	}
+	if !strings.Contains(mySQL, "pokermem.CustomFeeFn(v_m_round_id)") {
+		t.Errorf("MySQL expected //gorm:func pokermem.CustomFeeFn to preserve exact name, got:\n%s", mySQL)
+	}
+	if !strings.Contains(mySQL, "casinodb.StandaloneCalcFn(v_custom, v_jp)") {
+		t.Errorf("MySQL expected //gorm:func casinodb.StandaloneCalcFn to preserve exact name, got:\n%s", mySQL)
+	}
+	// 2. Zero-value initialization
+	for _, decl := range []string{
+		"DECLARE v_m_round_id BIGINT DEFAULT 0;",
+		"DECLARE v_m_amount DOUBLE DEFAULT 0;",
+		"DECLARE v_m_flag BOOLEAN DEFAULT FALSE;",
+		"DECLARE v_m_note TEXT DEFAULT '';",
+	} {
+		if !strings.Contains(mySQL, decl) {
+			t.Errorf("MySQL missing zero-value declaration %q. Got:\n%s", decl, mySQL)
+		}
+	}
+
+	pgSQL, err := ToPostgres(procs[0], "h1")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	// 1. Exact DB function names
+	if !strings.Contains(pgSQL, "pokermem.CasinogameFeeCurrent(v_m_round_id)") {
+		t.Errorf("Postgres expected pokermem.CasinogameFeeCurrent, got:\n%s", pgSQL)
+	}
+	if !strings.Contains(pgSQL, "casinodb.Casinogame_calcJackpotContribution(v_fee, v_m_amount)") {
+		t.Errorf("Postgres expected casinodb.Casinogame_calcJackpotContribution, got:\n%s", pgSQL)
+	}
+	if !strings.Contains(pgSQL, "pokermem.CustomFeeFn(v_m_round_id)") {
+		t.Errorf("Postgres expected //gorm:func pokermem.CustomFeeFn to preserve exact name, got:\n%s", pgSQL)
+	}
+	if !strings.Contains(pgSQL, "casinodb.StandaloneCalcFn(v_custom, v_jp)") {
+		t.Errorf("Postgres expected //gorm:func casinodb.StandaloneCalcFn to preserve exact name, got:\n%s", pgSQL)
+	}
+	// 2. Zero-value initialization
+	for _, decl := range []string{
+		"v_m_round_id BIGINT := 0;",
+		"v_m_amount NUMERIC := 0;",
+		"v_m_flag BOOLEAN := FALSE;",
+		"v_m_note TEXT := '';",
+	} {
+		if !strings.Contains(pgSQL, decl) {
+			t.Errorf("Postgres missing zero-value declaration %q. Got:\n%s", decl, pgSQL)
+		}
+	}
+	// 3. Postgres SELECT ... INTO NOT FOUND guard preserving prior values
+	for _, snippet := range []string{
+		"_prev_0 v_m_round_id%TYPE := v_m_round_id;",
+		"_prev_1 v_m_amount%TYPE := v_m_amount;",
+		"SELECT id, amount INTO v_m_round_id, v_m_amount FROM rounds WHERE id = p_roundID;",
+		"IF NOT FOUND THEN",
+		"v_m_round_id := _prev_0;",
+		"v_m_amount := _prev_1;",
+	} {
+		if !strings.Contains(pgSQL, snippet) {
+			t.Errorf("Postgres missing SelectInto NOT FOUND preservation snippet %q. Got:\n%s", snippet, pgSQL)
+		}
+	}
+}
+
+func TestCommentsMultilineFormattingSignalAndMultiResultSet(t *testing.T) {
+	src := `package testpkg
+
+import (
+	"context"
+	"github.com/user/gormproc"
+	"gorm.io/gorm"
+)
+
+type MultiRes struct {
+	Balance float64
+}
+
+type SubSvc struct {
+	gormproc.BaseService
+}
+
+//gorm:proc casinodb.BigSubProc
+func (s *SubSvc) BigSubProc(a int64, b int64, c int64, d int64, e int64) error {
+	return nil
+}
+
+type Svc2 struct {
+	gormproc.BaseService
+	db  *gorm.DB
+	sub *SubSvc
+}
+
+// Procedure header comment
+//gorm:procedure
+func (s *Svc2) BookMulti(ctx context.Context, roundID int64, actionType int64, tags gormproc.JSON) (MultiRes, error) {
+	var res MultiRes
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		var bal float64 // player balance
+		var foundID int64
+
+		// Fetch round details
+		if err := gormproc.SelectInto(tx, ` + "`" + `
+			SELECT
+				id,
+				balance
+			FROM rounds
+			WHERE id = ?
+		` + "`" + `, roundID, &foundID, &bal); err != nil {
+			return err
+		}
+
+		if foundID == 0 {
+			return gormproc.SignalError(10001, "round not found")
+		}
+
+		if gormproc.JSONOverlaps(tags, "[]") {
+			switch actionType {
+			// Bet action
+			case 1:
+				tx.Exec(` + "`" + `
+					UPDATE rounds
+					SET status = 1
+					WHERE id = ?
+				` + "`" + `, roundID)
+			}
+		}
+
+		if err := s.sub.BigSubProc(roundID, actionType, 3, 4, 5); err != nil {
+			return err
+		}
+
+		res.Balance = bal
+		// Emit second result set
+		s.db.Raw("SELECT id, status FROM trans WHERE round_id = ?", roundID).Scan(&foundID)
+		return nil
+	})
+	return res, err
+}
+`
+	procs, err := parser.ParseSource(map[string]string{"bookmulti.go": src})
+	if err != nil {
+		t.Fatalf("ParseSource failed: %v", err)
+	}
+	if len(procs) != 1 {
+		t.Fatalf("Expected 1 procedure, got %d", len(procs))
+	}
+
+	mySQL, err := ToMySQL(procs[0], "m1")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	for _, want := range []string{
+		"DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK AND NO CHAIN; RESIGNAL; END;",
+		"DECLARE v_bal DOUBLE DEFAULT 0; /* player balance */",
+		"-- Procedure header comment",
+		"SET TRANSACTION ISOLATION LEVEL READ COMMITTED;",
+		"START TRANSACTION;",
+		"-- Fetch round details",
+		"INTO v_foundID, v_bal\n\tFROM rounds\n\tWHERE id = p_roundID;",
+		"SIGNAL SQLSTATE '45000' SET\n\t\t\tMYSQL_ERRNO = 10001,\n\t\t\tMESSAGE_TEXT = \"round not found\";",
+		"-- Bet action\n\t\tWHEN 1 THEN",
+		"CALL casinodb.BigSubProc(\n\t\tp_roundID,\n\t\tp_actionType,\n\t\t3,\n\t\t4,\n\t\t5\n\t);",
+		"SELECT v_Balance AS Balance;",
+		"SELECT id, status FROM trans WHERE round_id = p_roundID;",
+		"COMMIT AND NO CHAIN;",
+	} {
+		if !strings.Contains(mySQL, want) {
+			t.Errorf("MySQL missing expected snippet:\n%s\n\nGot:\n%s", want, mySQL)
+		}
+	}
+
+	pgSQL, err := ToPostgres(procs[0], "m1")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	for _, want := range []string{
+		"v_bal NUMERIC := 0; /* player balance */",
+		"-- Procedure header comment",
+		"-- Fetch round details",
+		"RAISE EXCEPTION 'round not found' USING ERRCODE = '45000';",
+		"-- Bet action",
+		"CALL casinodb.BigSubProc(",
+		"PERFORM id, status FROM trans WHERE round_id = p_roundID;",
+		"RETURN QUERY SELECT v_Balance AS Balance;",
+	} {
+		if !strings.Contains(pgSQL, want) {
+			t.Errorf("Postgres missing expected snippet:\n%s\n\nGot:\n%s", want, pgSQL)
+		}
+	}
+	if strings.Index(pgSQL, "RETURN QUERY SELECT v_Balance AS Balance;") > strings.Index(pgSQL, "PERFORM id, status FROM trans WHERE round_id = p_roundID;") {
+		t.Errorf("Postgres expected RETURN QUERY SELECT before PERFORM. Got:\n%s", pgSQL)
+	}
+}
+
+func TestPostgresRawQueryNormalizations(t *testing.T) {
+	src := `package testpkg
+
+import (
+	"context"
+	"github.com/user/gormproc"
+	"gorm.io/gorm"
+)
+
+type NormSvc struct {
+	gormproc.BaseService
+	db *gorm.DB
+}
+
+//gorm:procedure
+func (s *NormSvc) NormalizeProc(ctx context.Context, playerID int64, payload string) error {
+	var tx *gorm.DB
+	var accID int64
+	var idsJSON string
+	var cnt int64
+	var extVal string
+
+	gormproc.SelectInto(tx, "SELECT ACC_iID FROM pokermem.tbl_account USE INDEX(idx_ACC_PLY_ACP) WHERE ACC_PLY_iID = ?", playerID, &accID)
+	gormproc.SelectInto(tx, "SELECT JSON_ARRAYAGG(id) FROM items WHERE player_id = ? ORDER BY id", playerID, &idsJSON)
+	gormproc.SelectInto(tx, "SELECT CAST(JSON_EXTRACT(?, '$.count') AS UNSIGNED), JSON_LENGTH(?) FROM dual", payload, payload, &cnt, &extVal)
+	return nil
+}
+`
+	procs, err := parser.ParseSource(map[string]string{"norm.go": src})
+	if err != nil {
+		t.Fatalf("ParseSource failed: %v", err)
+	}
+	if len(procs) != 1 {
+		t.Fatalf("Expected 1 procedure, got %d", len(procs))
+	}
+
+	mySQL, err := ToMySQL(procs[0], "n1")
+	if err != nil {
+		t.Fatalf("ToMySQL failed: %v", err)
+	}
+	if !strings.Contains(mySQL, "FROM pokermem.tbl_account USE INDEX(idx_ACC_PLY_ACP) WHERE") {
+		t.Errorf("MySQL should preserve USE INDEX hint, got:\n%s", mySQL)
+	}
+
+	pgSQL, err := ToPostgres(procs[0], "n1")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	for _, want := range []string{
+		"FROM pokermem.tbl_account WHERE ACC_PLY_iID = p_playerID;",
+		"SELECT jsonb_agg(id ORDER BY id)::text INTO v_idsJSON FROM items WHERE player_id = p_playerID;",
+		"CAST((jsonb_path_query_first((p_payload)::jsonb, ('$.count')::jsonpath) #>> '{}') AS BIGINT)",
+		"jsonb_array_length((p_payload)::jsonb)",
+	} {
+		if !strings.Contains(pgSQL, want) {
+			t.Errorf("Postgres missing expected normalization %q.\nGot:\n%s", want, pgSQL)
+		}
+	}
+	if strings.Contains(pgSQL, "USE INDEX") {
+		t.Errorf("Postgres should strip USE INDEX hint, got:\n%s", pgSQL)
+	}
+}
+
+
+
 
 

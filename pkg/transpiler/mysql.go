@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"strconv"
 	"strings"
 
 	"github.com/user/gormproc/pkg/parser"
@@ -183,10 +184,10 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 						return "LAST_INSERT_ID()"
 					}
 					if sel.Sel.Name == "CasinogameFeeCurrent" {
-						return "pokermem.Casinogame_fee_current(" + extractArg(e.Args[0]) + ")"
+						return "pokermem.CasinogameFeeCurrent(" + extractArg(e.Args[0]) + ")"
 					}
 					if sel.Sel.Name == "CasinogameCalcJackpotContribution" {
-						return "casinodb.Casinogame_calc_jackpotContribution(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
+						return "casinodb.Casinogame_calcJackpotContribution(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
 					}
 					if sel.Sel.Name == "JSONOverlaps" {
 						return "JSON_OVERLAPS(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
@@ -218,6 +219,15 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 					if sel.Sel.Name == "JSONMergePreserve" {
 						return "JSON_MERGE_PRESERVE(" + extractArg(e.Args[0]) + ", " + extractArg(e.Args[1]) + ")"
 					}
+				} else if ext := proc.ResolveCallName(e); ext != "" {
+					var argStrs []string
+					for _, arg := range e.Args {
+						if id, ok := arg.(*ast.Ident); ok && id.Name == "ctx" {
+							continue
+						}
+						argStrs = append(argStrs, extractArg(arg))
+					}
+					return fmt.Sprintf("%s(%s)", ext, strings.Join(argStrs, ", "))
 				} else if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name != "fmt" {
 					var argStrs []string
 					for _, arg := range e.Args {
@@ -241,12 +251,16 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 					}
 					argStrs = append(argStrs, extractArg(arg))
 				}
+				if ext := proc.ResolveCallName(e); ext != "" {
+					return fmt.Sprintf("%s(%s)", ext, strings.Join(argStrs, ", "))
+				}
 				return fmt.Sprintf("%s(%s)", funId.Name, strings.Join(argStrs, ", "))
 			}
 		}
 		return "''"
 	}
 
+	varComments := make(map[string]string)
 	declaredVars := make(map[string]bool)
 	declareVar := func(name string, typeNode ast.Expr, valExpr ast.Expr) {
 		if declaredVars[name] || name == "res" || name == "err" || name == "_" {
@@ -261,12 +275,33 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		if valExpr != nil {
 			if _, ok := valExpr.(*ast.BasicLit); ok {
 				def = " DEFAULT " + extractArg(valExpr)
+			} else if id, ok := valExpr.(*ast.Ident); ok && (id.Name == "true" || id.Name == "false") {
+				def = " DEFAULT " + strings.ToUpper(id.Name)
 			}
 		}
-		declsBuf.WriteString(fmt.Sprintf("DECLARE v_%s %s%s;\n", name, typ, def))
+		if def == "" {
+			if zeroVal := defaultZeroValueForSQLType(typ); zeroVal != "" {
+				def = " DEFAULT " + zeroVal
+			}
+		}
+		declsBuf.WriteString(fmt.Sprintf("DECLARE v_%s %s%s;%s\n", name, typ, def, varComments[name]))
 	}
 
+	var resFields []string
+	resFieldSet := make(map[string]bool)
 	hasEmittedSelect := false
+	emittedResSelect := false
+	emitResFieldsSelect := func() {
+		if len(resFields) == 0 || emittedResSelect {
+			return
+		}
+		var selectCols []string
+		for _, field := range resFields {
+			selectCols = append(selectCols, fmt.Sprintf("v_%s AS %s", field, field))
+		}
+		bodyBuf.WriteString(fmt.Sprintf("SELECT %s;\n", strings.Join(selectCols, ", ")))
+		emittedResSelect = true
+	}
 	emitQuery := func(expr ast.Expr) bool {
 		if sel, ok := expr.(*ast.SelectorExpr); ok && sel.Sel.Name == "Error" {
 			expr = sel.X
@@ -286,15 +321,23 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && (sel.Sel.Name == "Exec" || sel.Sel.Name == "Raw") {
 			if len(call.Args) > 0 {
 				if lit, ok := call.Args[0].(*ast.BasicLit); ok {
-					query := strings.Trim(lit.Value, "`\"")
+					rawQuery := strings.Trim(lit.Value, "`\"")
+					isMultiline := strings.Contains(rawQuery, "\n")
+					query := rawQuery
+					if isMultiline {
+						query = dedentSQL(query)
+					}
 					for i := 1; i < len(call.Args); i++ {
 						query = strings.Replace(query, "?", extractArg(call.Args[i]), 1)
 					}
-					bodyBuf.WriteString(query + ";\n")
 					queryUpper := strings.ToUpper(strings.TrimSpace(query))
 					if strings.HasPrefix(queryUpper, "SELECT") {
+						if len(resFields) > 0 && !emittedResSelect {
+							emitResFieldsSelect()
+						}
 						hasEmittedSelect = true
 					}
+					bodyBuf.WriteString(query + ";\n")
 					return true
 				}
 			}
@@ -302,17 +345,87 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		return false
 	}
 
-	// Pre-collect variable declarations from function body
+	emitSelectInto := func(call *ast.CallExpr) bool {
+		if len(call.Args) < 2 {
+			return false
+		}
+		queryLit, ok := call.Args[1].(*ast.BasicLit)
+		if !ok {
+			return false
+		}
+		rawQuery := strings.Trim(queryLit.Value, "`\"")
+		isMultiline := strings.Contains(rawQuery, "\n")
+		query := rawQuery
+		if isMultiline {
+			query = dedentSQL(query)
+		} else {
+			query = strings.ReplaceAll(query, "\t", " ")
+		}
+
+		numQs := strings.Count(query, "?")
+		if 2+numQs > len(call.Args) {
+			return false
+		}
+		inArgs := call.Args[2 : 2+numQs]
+		outArgs := call.Args[2+numQs:]
+
+		for _, inArg := range inArgs {
+			query = strings.Replace(query, "?", extractArg(inArg), 1)
+		}
+
+		idxFrom := findTopLevelFrom(query)
+		if idxFrom == -1 {
+			return false
+		}
+		selectPart := strings.TrimSpace(query[:idxFrom])
+		fromPart := strings.TrimSpace(query[idxFrom:])
+
+		var outs []string
+		for _, outArg := range outArgs {
+			outs = append(outs, extractArg(outArg))
+		}
+
+		if isMultiline {
+			bodyBuf.WriteString(fmt.Sprintf("%s\nINTO %s\n%s;\n", selectPart, strings.Join(outs, ", "), fromPart))
+		} else {
+			bodyBuf.WriteString(fmt.Sprintf("%s INTO %s %s;\n", selectPart, strings.Join(outs, ", "), fromPart))
+		}
+		return true
+	}
+
+	// Emit procedure doc comments (excluding //gorm:... directives) at the top of BEGIN
+	if proc.Func != nil && proc.Func.Doc != nil {
+		var docLines []string
+		for _, c := range proc.Func.Doc.List {
+			docLines = append(docLines, c.Text)
+		}
+		if sqlComments := formatSQLCommentLines(strings.Join(docLines, "\n")); sqlComments != "" {
+			bodyBuf.WriteString(sqlComments)
+		}
+	}
+
+	// Pre-collect variable declarations and their comments from function body
 	if fn.Body != nil {
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			if gen, ok := n.(*ast.GenDecl); ok && gen.Tok == token.VAR {
 				for _, spec := range gen.Specs {
 					if vSpec, ok := spec.(*ast.ValueSpec); ok {
+						cg := vSpec.Comment
+						if cg == nil {
+							cg = vSpec.Doc
+						}
+						if cg == nil && len(gen.Specs) == 1 {
+							cg = gen.Doc
+						}
+						commentStr := formatInlineVarComment(cg)
 						var val ast.Expr
 						if len(vSpec.Values) > 0 {
 							val = vSpec.Values[0]
 						}
 						for _, name := range vSpec.Names {
+							if commentStr != "" && varComments[name.Name] == "" {
+								varComments[name.Name] = commentStr
+							}
 							declareVar(name.Name, vSpec.Type, val)
 						}
 					}
@@ -332,8 +445,6 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		})
 	}
 
-	var resFields []string
-	resFieldSet := make(map[string]bool)
 	var loopStack []loopContext
 	loopSeq := 0
 	inSwitchDepth := 0
@@ -576,35 +687,9 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 						} else if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
 							if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 								if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name == "gormproc" && sel.Sel.Name == "SelectInto" {
-									if len(call.Args) >= 2 {
-										if queryLit, ok := call.Args[1].(*ast.BasicLit); ok {
-											query := strings.Trim(queryLit.Value, "`\"")
-											query = strings.ReplaceAll(query, "\n", " ")
-											query = strings.ReplaceAll(query, "\t", " ")
-
-											numQs := strings.Count(query, "?")
-											inArgs := call.Args[2 : 2+numQs]
-											outArgs := call.Args[2+numQs:]
-
-											for _, inArg := range inArgs {
-												query = strings.Replace(query, "?", extractArg(inArg), 1)
-											}
-
-												idxFrom := findTopLevelFrom(query)
-												if idxFrom != -1 {
-													selectPart := query[:idxFrom]
-													fromPart := query[idxFrom:]
-
-													var outs []string
-													for _, outArg := range outArgs {
-														outs = append(outs, extractArg(outArg))
-													}
-
-													bodyBuf.WriteString(fmt.Sprintf("%s INTO %s %s;\n", strings.TrimSpace(selectPart), strings.Join(outs, ", "), strings.TrimSpace(fromPart)))
-													handledInit = true
-												}
-											}
-										}
+									if emitSelectInto(call) {
+										handledInit = true
+									}
 								} else {
 									args := []string{}
 									for _, arg := range call.Args {
@@ -614,7 +699,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 										args = append(args, extractArg(arg))
 									}
 									subName := resolveSubProcCallName(proc, call, sel.Sel.Name)
-									bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
+									bodyBuf.WriteString(formatCallStmt(subName, args))
 									handledInit = true
 								}
 							} else if id, ok := call.Fun.(*ast.Ident); ok {
@@ -626,7 +711,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 									args = append(args, extractArg(arg))
 								}
 								subName := resolveSubProcCallName(proc, call, id.Name)
-								bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
+								bodyBuf.WriteString(formatCallStmt(subName, args))
 								handledInit = true
 							}
 						}
@@ -680,13 +765,21 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 					continue
 				}
 				if call, ok := res.(*ast.CallExpr); ok {
-					if sel, ok := call.Fun.(*ast.SelectorExpr); ok && (sel.Sel.Name == "New" || sel.Sel.Name == "Errorf") {
-						if len(call.Args) > 0 {
-							if lit, ok := call.Args[0].(*ast.BasicLit); ok {
-								bodyBuf.WriteString(fmt.Sprintf("SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = %s;\n", lit.Value))
-							}
+					if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+						if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name == "gormproc" && sel.Sel.Name == "SignalError" && len(call.Args) >= 2 {
+							errnoExpr := extractArg(call.Args[0])
+							msgExpr := extractArg(call.Args[1])
+							bodyBuf.WriteString(fmt.Sprintf("SIGNAL SQLSTATE '45000' SET\n\tMYSQL_ERRNO = %s,\n\tMESSAGE_TEXT = %s;\n", errnoExpr, msgExpr))
+							continue
 						}
-						continue
+						if sel.Sel.Name == "New" || sel.Sel.Name == "Errorf" {
+							if len(call.Args) > 0 {
+								if lit, ok := call.Args[0].(*ast.BasicLit); ok {
+									bodyBuf.WriteString(fmt.Sprintf("SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = %s;\n", lit.Value))
+								}
+							}
+							continue
+						}
 					}
 				}
 				if idx == 0 && analysis != nil && analysis.ReturnsResult {
@@ -700,37 +793,20 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 				return
 			}
 			if call, ok := s.X.(*ast.CallExpr); ok {
+				if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "__gormproc_comment__" {
+					if len(call.Args) == 1 {
+						if lit, ok := call.Args[0].(*ast.BasicLit); ok {
+							if text, err := strconv.Unquote(lit.Value); err == nil {
+								bodyBuf.WriteString(formatSQLCommentLines(text))
+							}
+						}
+					}
+					return
+				}
 				if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 					if pkgId, ok := sel.X.(*ast.Ident); ok && pkgId.Name == "gormproc" {
 						if sel.Sel.Name == "SelectInto" {
-							if len(call.Args) >= 2 {
-								if queryLit, ok := call.Args[1].(*ast.BasicLit); ok {
-									query := strings.Trim(queryLit.Value, "`\"")
-									query = strings.ReplaceAll(query, "\n", " ")
-									query = strings.ReplaceAll(query, "\t", " ")
-
-									numQs := strings.Count(query, "?")
-									inArgs := call.Args[2 : 2+numQs]
-									outArgs := call.Args[2+numQs:]
-
-									for _, inArg := range inArgs {
-										query = strings.Replace(query, "?", extractArg(inArg), 1)
-									}
-
-									idxFrom := findTopLevelFrom(query)
-									if idxFrom != -1 {
-										selectPart := query[:idxFrom]
-										fromPart := query[idxFrom:]
-
-										var outs []string
-										for _, outArg := range outArgs {
-											outs = append(outs, extractArg(outArg))
-										}
-
-										bodyBuf.WriteString(fmt.Sprintf("%s INTO %s %s;\n", strings.TrimSpace(selectPart), strings.Join(outs, ", "), strings.TrimSpace(fromPart)))
-									}
-								}
-							}
+							emitSelectInto(call)
 						}
 					} else {
 						args := []string{}
@@ -741,7 +817,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 							args = append(args, extractArg(arg))
 						}
 						subName := resolveSubProcCallName(proc, call, sel.Sel.Name)
-						bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
+						bodyBuf.WriteString(formatCallStmt(subName, args))
 					}
 				} else if id, ok := call.Fun.(*ast.Ident); ok {
 					args := []string{}
@@ -752,13 +828,14 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 						args = append(args, extractArg(arg))
 					}
 					subName := resolveSubProcCallName(proc, call, id.Name)
-					bodyBuf.WriteString(fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", ")))
+					bodyBuf.WriteString(formatCallStmt(subName, args))
 				}
 			}
 		}
 	}
 
 	// Walk top-level statements, and if a statement is or contains a Transaction call, walk inside it
+	hasTransaction := false
 	if fn.Body != nil {
 		for _, stmt := range fn.Body.List {
 			handledTx := false
@@ -768,7 +845,11 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 						if len(call.Args) > 0 {
 							if lit, ok := call.Args[0].(*ast.FuncLit); ok {
 								handledTx = true
+								hasTransaction = true
+								bodyBuf.WriteString("SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\n")
+								bodyBuf.WriteString("START TRANSACTION;\n")
 								walkStmt(lit.Body)
+								bodyBuf.WriteString("COMMIT AND NO CHAIN;\n")
 							}
 						}
 					}
@@ -781,14 +862,14 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		}
 	}
 
-	// If struct fields were assigned (e.g. res.RoundID = ...) and no terminating SELECT query was emitted,
+	if hasTransaction {
+		declsBuf.WriteString("DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK AND NO CHAIN; RESIGNAL; END;\n")
+	}
+
+	// If struct fields were assigned (e.g. res.RoundID = ...) and the struct result SELECT hasn't been emitted yet,
 	// emit the result projection SELECT statement so GORM Raw().Scan() receives the row.
-	if len(resFields) > 0 && !hasEmittedSelect {
-		var selectCols []string
-		for _, field := range resFields {
-			selectCols = append(selectCols, fmt.Sprintf("v_%s AS %s", field, field))
-		}
-		bodyBuf.WriteString(fmt.Sprintf("SELECT %s;\n", strings.Join(selectCols, ", ")))
+	if len(resFields) > 0 && !emittedResSelect {
+		emitResFieldsSelect()
 	} else if analysis != nil && analysis.ReturnsResult && !hasEmittedSelect && scalarRetExpr != "" && scalarRetExpr != "NULL" && scalarRetExpr != "''" {
 		bodyBuf.WriteString(fmt.Sprintf("SELECT %s AS result;\n", scalarRetExpr))
 	}
@@ -815,10 +896,14 @@ func formatSQL(sql string) string {
 			continue
 		}
 
-		outdentNow := false
-		if strings.HasPrefix(trimmed, "END") || trimmed == "ELSE" || strings.HasPrefix(trimmed, "WHEN ") || strings.HasPrefix(trimmed, "ELSEIF ") {
-			outdentNow = true
-		}
+		isBlockEnd := (trimmed == "END;" && !strings.HasPrefix(line, " ")) ||
+			strings.HasPrefix(trimmed, "END IF") ||
+			strings.HasPrefix(trimmed, "END WHILE") ||
+			strings.HasPrefix(trimmed, "END CASE") ||
+			strings.HasPrefix(trimmed, "END LOOP")
+		isWhenThen := strings.HasPrefix(trimmed, "WHEN ") && strings.HasSuffix(trimmed, " THEN") && !strings.Contains(trimmed, " THEN ")
+
+		outdentNow := isBlockEnd || trimmed == "ELSE" || isWhenThen || strings.HasPrefix(trimmed, "ELSEIF ")
 
 		currentIndent := indent
 		if outdentNow {
@@ -828,12 +913,13 @@ func formatSQL(sql string) string {
 			}
 		}
 
-		formatted = append(formatted, strings.Repeat("\t", currentIndent)+trimmed)
+		content := strings.TrimRight(line, " \t\r")
+		formatted = append(formatted, strings.Repeat("\t", currentIndent)+content)
 
-		if strings.HasPrefix(trimmed, "BEGIN") || strings.HasPrefix(trimmed, "IF ") || strings.HasPrefix(trimmed, "WHILE ") || (strings.Contains(trimmed, ": WHILE ") && strings.HasSuffix(trimmed, " DO")) || strings.HasPrefix(trimmed, "CASE ") || trimmed == "ELSE" || strings.HasPrefix(trimmed, "WHEN ") || strings.HasPrefix(trimmed, "ELSEIF ") {
+		if strings.HasPrefix(trimmed, "BEGIN") || strings.HasPrefix(trimmed, "IF ") || strings.HasPrefix(trimmed, "WHILE ") || (strings.Contains(trimmed, ": WHILE ") && strings.HasSuffix(trimmed, " DO")) || strings.HasPrefix(trimmed, "CASE ") || trimmed == "ELSE" || isWhenThen || strings.HasPrefix(trimmed, "ELSEIF ") {
 			indent = currentIndent + 1
 		}
-		if strings.HasPrefix(trimmed, "END") {
+		if isBlockEnd {
 			indent = currentIndent
 		}
 	}

@@ -1,6 +1,7 @@
 package transpiler
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -288,12 +289,387 @@ func isIdentByte(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
 }
 
-// normalizeQueryForPostgres translates common MySQL SQL dialect functions (IFNULL, IF(c,a,b))
-// inside raw SQL strings into standard PostgreSQL equivalents (COALESCE, CASE WHEN ... END).
+// normalizeQueryForPostgres translates common MySQL SQL dialect functions (IFNULL, IF(c,a,b),
+// JSON_ARRAYAGG, JSON_EXTRACT, JSON_LENGTH, CAST(... AS UNSIGNED)) and strips MySQL index hints
+// inside raw SQL strings into standard PostgreSQL equivalents.
 func normalizeQueryForPostgres(query string) string {
-	out := replaceFuncNameOutsideQuotes(query, "IFNULL", "COALESCE")
+	out := stripMySQLIndexHints(query)
+	out = replaceFuncNameOutsideQuotes(out, "IFNULL", "COALESCE")
 	out = rewriteInlineIfToCase(out)
+	out = rewriteAsUnsigned(out)
+	out = rewriteJSONLength(out)
+	out = rewriteJSONExtract(out)
+	out = rewriteJSONArrayAgg(out)
 	return out
+}
+
+// skipQuotedOrAdvance writes/skips a quoted string literal starting at s[i].
+func skipQuotedSpan(s string, i int) int {
+	q := s[i]
+	i++
+	for i < len(s) {
+		if s[i] == q {
+			return i + 1
+		}
+		i++
+	}
+	return i
+}
+
+// findMatchingParen returns the index of the ')' matching '(' at openIdx, or -1.
+func findMatchingParen(s string, openIdx int) int {
+	depth := 0
+	for i := openIdx; i < len(s); i++ {
+		c := s[i]
+		if c == '\'' || c == '"' || c == '`' {
+			i = skipQuotedSpan(s, i) - 1
+			continue
+		}
+		if c == '(' {
+			depth++
+		} else if c == ')' {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// splitTopLevelArgs splits a comma-separated argument list at depth 0 outside quotes.
+func splitTopLevelArgs(argList string) []string {
+	var args []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(argList); i++ {
+		c := argList[i]
+		if c == '\'' || c == '"' || c == '`' {
+			i = skipQuotedSpan(argList, i) - 1
+			continue
+		}
+		if c == '(' {
+			depth++
+		} else if c == ')' && depth > 0 {
+			depth--
+		} else if c == ',' && depth == 0 {
+			args = append(args, strings.TrimSpace(argList[start:i]))
+			start = i + 1
+		}
+	}
+	args = append(args, strings.TrimSpace(argList[start:]))
+	return args
+}
+
+// matchKeywordAt checks if upper[i:] starts with kw with word boundaries on both sides.
+func matchKeywordAt(upper string, i int, kw string) bool {
+	if i+len(kw) > len(upper) {
+		return false
+	}
+	if i > 0 && isIdentByte(upper[i-1]) {
+		return false
+	}
+	if upper[i:i+len(kw)] != kw {
+		return false
+	}
+	if i+len(kw) < len(upper) && isIdentByte(upper[i+len(kw)]) {
+		return false
+	}
+	return true
+}
+
+func stripMySQLIndexHints(s string) string {
+	var b strings.Builder
+	upper := strings.ToUpper(s)
+	n := len(s)
+	for i := 0; i < n; {
+		c := s[i]
+		if c == '\'' || c == '"' || c == '`' {
+			end := skipQuotedSpan(s, i)
+			b.WriteString(s[i:end])
+			i = end
+			continue
+		}
+		matchedHint := ""
+		for _, kw := range []string{"USE", "FORCE", "IGNORE"} {
+			if matchKeywordAt(upper, i, kw) {
+				matchedHint = kw
+				break
+			}
+		}
+		if matchedHint != "" {
+			j := i + len(matchedHint)
+			for j < n && isSQLSpace(s[j]) {
+				j++
+			}
+			if matchKeywordAt(upper, j, "INDEX") {
+				j += len("INDEX")
+				for j < n && isSQLSpace(s[j]) {
+					j++
+				}
+				if j < n && s[j] == '(' {
+					closeIdx := findMatchingParen(s, j)
+					if closeIdx != -1 {
+						// Trim a single preceding space/tab if there is also space after ')' or end of line/string
+						cur := b.String()
+						if len(cur) > 0 && (cur[len(cur)-1] == ' ' || cur[len(cur)-1] == '\t') {
+							if closeIdx+1 >= n || isSQLSpace(s[closeIdx+1]) {
+								trimmed := cur[:len(cur)-1]
+								b.Reset()
+								b.WriteString(trimmed)
+							}
+						}
+						i = closeIdx + 1
+						continue
+					}
+				}
+			}
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+func rewriteAsUnsigned(s string) string {
+	var b strings.Builder
+	upper := strings.ToUpper(s)
+	n := len(s)
+	for i := 0; i < n; {
+		c := s[i]
+		if c == '\'' || c == '"' || c == '`' {
+			end := skipQuotedSpan(s, i)
+			b.WriteString(s[i:end])
+			i = end
+			continue
+		}
+		if matchKeywordAt(upper, i, "AS") {
+			j := i + 2
+			wsStart := j
+			for j < n && isSQLSpace(s[j]) {
+				j++
+			}
+			if j > wsStart && matchKeywordAt(upper, j, "UNSIGNED") {
+				b.WriteString("AS BIGINT")
+				i = j + len("UNSIGNED")
+				continue
+			}
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+func rewriteJSONLength(s string) string {
+	var b strings.Builder
+	upper := strings.ToUpper(s)
+	n := len(s)
+	const fn = "JSON_LENGTH"
+	for i := 0; i < n; {
+		c := s[i]
+		if c == '\'' || c == '"' || c == '`' {
+			end := skipQuotedSpan(s, i)
+			b.WriteString(s[i:end])
+			i = end
+			continue
+		}
+		if matchKeywordAt(upper, i, fn) {
+			j := i + len(fn)
+			for j < n && (s[j] == ' ' || s[j] == '\t') {
+				j++
+			}
+			if j < n && s[j] == '(' {
+				closeIdx := findMatchingParen(s, j)
+				if closeIdx != -1 {
+					args := splitTopLevelArgs(s[j+1 : closeIdx])
+					if len(args) == 1 {
+						b.WriteString(fmt.Sprintf("jsonb_array_length((%s)::jsonb)", rewriteJSONLength(args[0])))
+						i = closeIdx + 1
+						continue
+					} else if len(args) >= 2 {
+						b.WriteString(fmt.Sprintf("jsonb_array_length(jsonb_path_query_first((%s)::jsonb, (%s)::jsonpath))", rewriteJSONLength(args[0]), args[1]))
+						i = closeIdx + 1
+						continue
+					}
+				}
+			}
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+func rewriteJSONExtract(s string) string {
+	var b strings.Builder
+	upper := strings.ToUpper(s)
+	n := len(s)
+	const fn = "JSON_EXTRACT"
+	for i := 0; i < n; {
+		c := s[i]
+		if c == '\'' || c == '"' || c == '`' {
+			end := skipQuotedSpan(s, i)
+			b.WriteString(s[i:end])
+			i = end
+			continue
+		}
+		if matchKeywordAt(upper, i, fn) {
+			j := i + len(fn)
+			for j < n && (s[j] == ' ' || s[j] == '\t') {
+				j++
+			}
+			if j < n && s[j] == '(' {
+				closeIdx := findMatchingParen(s, j)
+				if closeIdx != -1 {
+					args := splitTopLevelArgs(s[j+1 : closeIdx])
+					if len(args) >= 2 {
+						doc := rewriteJSONExtract(args[0])
+						path := args[1]
+						b.WriteString(fmt.Sprintf("(jsonb_path_query_first((%s)::jsonb, (%s)::jsonpath) #>> '{}')", doc, path))
+						i = closeIdx + 1
+						continue
+					}
+				}
+			}
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+func hasTopLevelKeyword(s, kw1, kw2 string) int {
+	upper := strings.ToUpper(s)
+	depth := 0
+	n := len(s)
+	for i := 0; i < n; i++ {
+		c := s[i]
+		if c == '\'' || c == '"' || c == '`' {
+			i = skipQuotedSpan(s, i) - 1
+			continue
+		}
+		if c == '(' {
+			depth++
+			continue
+		}
+		if c == ')' && depth > 0 {
+			depth--
+			continue
+		}
+		if depth == 0 && matchKeywordAt(upper, i, kw1) {
+			if kw2 == "" {
+				return i
+			}
+			j := i + len(kw1)
+			wsStart := j
+			for j < n && isSQLSpace(s[j]) {
+				j++
+			}
+			if j > wsStart && matchKeywordAt(upper, j, kw2) {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func rewriteJSONArrayAgg(s string) string {
+	upper := strings.ToUpper(s)
+	const fn = "JSON_ARRAYAGG"
+	// Find first top-level JSON_ARRAYAGG(
+	aggIdx := -1
+	openIdx := -1
+	closeIdx := -1
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\'' || c == '"' || c == '`' {
+			i = skipQuotedSpan(s, i) - 1
+			continue
+		}
+		if c == '(' {
+			depth++
+			continue
+		}
+		if c == ')' && depth > 0 {
+			depth--
+			continue
+		}
+		if depth == 0 && matchKeywordAt(upper, i, fn) {
+			j := i + len(fn)
+			for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+				j++
+			}
+			if j < len(s) && s[j] == '(' {
+				cl := findMatchingParen(s, j)
+				if cl != -1 {
+					aggIdx = i
+					openIdx = j
+					closeIdx = cl
+					break
+				}
+			}
+		}
+	}
+	if aggIdx == -1 {
+		return s
+	}
+
+	expr := strings.TrimSpace(s[openIdx+1 : closeIdx])
+	hasGroupBy := hasTopLevelKeyword(s, "GROUP", "BY") != -1
+	if !hasGroupBy {
+		tail := s[closeIdx+1:]
+		orderIdx := hasTopLevelKeyword(tail, "ORDER", "BY")
+		if orderIdx != -1 {
+			// Advance past "ORDER" + whitespace + "BY" + whitespace
+			j := orderIdx + len("ORDER")
+			for j < len(tail) && isSQLSpace(tail[j]) {
+				j++
+			}
+			j += len("BY")
+			for j < len(tail) && isSQLSpace(tail[j]) {
+				j++
+			}
+			// Find end of ORDER BY expression (stop at LIMIT, OFFSET, FETCH, FOR, ;, or end)
+			orderEnd := len(tail)
+			tailUpper := strings.ToUpper(tail)
+			d := 0
+			for k := j; k < len(tail); k++ {
+				c := tail[k]
+				if c == '\'' || c == '"' || c == '`' {
+					k = skipQuotedSpan(tail, k) - 1
+					continue
+				}
+				if c == '(' {
+					d++
+					continue
+				}
+				if c == ')' && d > 0 {
+					d--
+					continue
+				}
+				if d == 0 {
+					if c == ';' || matchKeywordAt(tailUpper, k, "LIMIT") || matchKeywordAt(tailUpper, k, "OFFSET") || matchKeywordAt(tailUpper, k, "FETCH") || matchKeywordAt(tailUpper, k, "FOR") {
+						orderEnd = k
+						break
+					}
+				}
+			}
+			orderExpr := strings.TrimSpace(tail[j:orderEnd])
+			if orderExpr != "" {
+				beforeOrder := strings.TrimRight(tail[:orderIdx], " \t\r\n")
+				afterOrder := strings.TrimLeft(tail[orderEnd:], " \t")
+				newTail := beforeOrder
+				if afterOrder != "" {
+					newTail += " " + afterOrder
+				}
+				return s[:aggIdx] + fmt.Sprintf("jsonb_agg(%s ORDER BY %s)::text", expr, orderExpr) + newTail
+			}
+		}
+	}
+
+	return s[:aggIdx] + fmt.Sprintf("jsonb_agg(%s)::text", expr) + rewriteJSONArrayAgg(s[closeIdx+1:])
 }
 
 func replaceFuncNameOutsideQuotes(s, oldFn, newFn string) string {
@@ -454,12 +830,16 @@ func findTopLevelFrom(query string) int {
 			continue
 		}
 		if depth == 0 && i+6 <= len(upper) {
-			if upper[i:i+6] == " FROM " {
+			if isSQLSpace(upper[i]) && upper[i+1:i+5] == "FROM" && isSQLSpace(upper[i+5]) {
 				return i
 			}
 		}
 	}
 	return -1
+}
+
+func isSQLSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
 func formatToConcat(format string, args []string) string {
@@ -654,4 +1034,216 @@ func inferTypeFromExpr(expr ast.Expr, varName string, dialect string) string {
 	}
 
 	return strType
+}
+
+// defaultZeroValueForSQLType returns the SQL literal representing Go's zero value for the given SQL type.
+func defaultZeroValueForSQLType(sqlType string) string {
+	upper := strings.ToUpper(strings.TrimSpace(sqlType))
+	switch {
+	case upper == "BIGINT" || upper == "INT" || upper == "INTEGER" || upper == "SMALLINT" || upper == "TINYINT" ||
+		upper == "DOUBLE" || upper == "FLOAT" || upper == "REAL" ||
+		strings.HasPrefix(upper, "NUMERIC") || strings.HasPrefix(upper, "DECIMAL"):
+		return "0"
+	case upper == "BOOLEAN" || upper == "BOOL":
+		return "FALSE"
+	case upper == "TEXT" || strings.HasPrefix(upper, "VARCHAR") || strings.HasPrefix(upper, "CHAR"):
+		return "''"
+	default:
+		return ""
+	}
+}
+
+// dedentSQL strips leading/trailing blank lines and removes the common leading whitespace
+// prefix from all non-empty lines of a multi-line SQL string.
+func dedentSQL(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	lines := strings.Split(s, "\n")
+	start := 0
+	for start < len(lines) && strings.TrimSpace(lines[start]) == "" {
+		start++
+	}
+	end := len(lines)
+	for end > start && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	lines = lines[start:end]
+	if len(lines) == 0 {
+		return ""
+	}
+	for i, line := range lines {
+		lines[i] = strings.ReplaceAll(line, "\t", "    ")
+	}
+	minIndent := -1
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		indent := 0
+		for indent < len(line) && line[indent] == ' ' {
+			indent++
+		}
+		if i == 0 && indent == 0 && len(lines) > 1 {
+			continue
+		}
+		if minIndent == -1 || indent < minIndent {
+			minIndent = indent
+		}
+	}
+	if minIndent > 0 {
+		for i, line := range lines {
+			if strings.TrimSpace(line) == "" {
+				lines[i] = ""
+				continue
+			}
+			indent := 0
+			for indent < len(line) && line[indent] == ' ' {
+				indent++
+			}
+			if indent >= minIndent {
+				lines[i] = line[minIndent:]
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// formatSQLCommentLines converts Go comment text (// or /* ... */) to SQL comment lines (-- or /* ... */).
+func formatSQLCommentLines(text string) string {
+	rawLines := strings.Split(text, "\n")
+	var out []string
+	for _, l := range rawLines {
+		trimmed := strings.TrimSpace(l)
+		if trimmed == "" || strings.HasPrefix(trimmed, "//gorm:") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "//") {
+			body := strings.TrimPrefix(trimmed, "//")
+			body = strings.TrimPrefix(body, " ")
+			if body == "" {
+				out = append(out, "--")
+			} else {
+				out = append(out, "-- "+body)
+			}
+		} else {
+			out = append(out, trimmed)
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, "\n") + "\n"
+}
+
+// formatInlineVarComment formats a Go CommentGroup on a var declaration into an inline SQL /* ... */ comment.
+func formatInlineVarComment(cg *ast.CommentGroup) string {
+	if cg == nil {
+		return ""
+	}
+	var parts []string
+	for _, c := range cg.List {
+		t := strings.TrimSpace(c.Text)
+		if strings.HasPrefix(t, "//gorm:") {
+			continue
+		}
+		if strings.HasPrefix(t, "//") {
+			t = strings.TrimSpace(strings.TrimPrefix(t, "//"))
+		} else if strings.HasPrefix(t, "/*") && strings.HasSuffix(t, "*/") {
+			t = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(t, "/*"), "*/"))
+		}
+		t = strings.ReplaceAll(t, "/*", "")
+		t = strings.ReplaceAll(t, "*/", "")
+		if t != "" {
+			parts = append(parts, t)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " /* " + strings.Join(parts, " ") + " */"
+}
+
+// formatCallStmt formats a SQL CALL statement onto a single line when <= 4 args,
+// or across multiple lines (1 arg per line) when > 4 args.
+func formatCallStmt(subName string, args []string) string {
+	if len(args) <= 4 {
+		return fmt.Sprintf("CALL %s(%s);\n", subName, strings.Join(args, ", "))
+	}
+	return fmt.Sprintf("CALL %s(\n\t%s\n);\n", subName, strings.Join(args, ",\n\t"))
+}
+
+// emitPostgresSelectInto emits a PL/pgSQL SELECT ... INTO statement wrapped in a sub-block that
+// preserves target variables' prior values when 0 rows are returned (matching Go and MySQL semantics),
+// while keeping legitimate NULL column values when a row IS found.
+func emitPostgresSelectInto(bodyBuf *bytes.Buffer, call *ast.CallExpr, extractArg func(ast.Expr) string) bool {
+	if len(call.Args) < 2 {
+		return false
+	}
+	queryLit, ok := call.Args[1].(*ast.BasicLit)
+	if !ok {
+		return false
+	}
+	rawQuery := strings.Trim(queryLit.Value, "`\"")
+	isMultiline := strings.Contains(rawQuery, "\n")
+	query := normalizeQueryForPostgres(rawQuery)
+	if isMultiline {
+		query = dedentSQL(query)
+	} else {
+		query = strings.ReplaceAll(query, "\t", " ")
+	}
+
+	numQs := strings.Count(query, "?")
+	if 2+numQs > len(call.Args) {
+		return false
+	}
+	inArgs := call.Args[2 : 2+numQs]
+	outArgs := call.Args[2+numQs:]
+
+	for _, inArg := range inArgs {
+		query = strings.Replace(query, "?", extractArg(inArg), 1)
+	}
+
+	idxFrom := findTopLevelFrom(query)
+	if idxFrom == -1 {
+		return false
+	}
+
+	selectPart := strings.TrimSpace(query[:idxFrom])
+	fromPart := strings.TrimSpace(query[idxFrom:])
+
+	var outs []string
+	for _, outArg := range outArgs {
+		outs = append(outs, extractArg(outArg))
+	}
+
+	var selectStmt string
+	if isMultiline {
+		selectStmt = fmt.Sprintf("%s\nINTO %s\n%s;", selectPart, strings.Join(outs, ", "), fromPart)
+	} else {
+		selectStmt = fmt.Sprintf("%s INTO %s %s;", selectPart, strings.Join(outs, ", "), fromPart)
+	}
+
+	if len(outs) == 0 {
+		if isMultiline {
+			bodyBuf.WriteString(fmt.Sprintf("%s\n%s;\n", selectPart, fromPart))
+		} else {
+			bodyBuf.WriteString(fmt.Sprintf("%s %s;\n", selectPart, fromPart))
+		}
+		return true
+	}
+
+	bodyBuf.WriteString("DECLARE\n")
+	for i, outVar := range outs {
+		bodyBuf.WriteString(fmt.Sprintf("\t_prev_%d %s%%TYPE := %s;\n", i, outVar, outVar))
+	}
+	bodyBuf.WriteString("BEGIN\n")
+	for _, line := range strings.Split(selectStmt, "\n") {
+		bodyBuf.WriteString("\t" + line + "\n")
+	}
+	bodyBuf.WriteString("\tIF NOT FOUND THEN\n")
+	for i, outVar := range outs {
+		bodyBuf.WriteString(fmt.Sprintf("\t\t%s := _prev_%d;\n", outVar, i))
+	}
+	bodyBuf.WriteString("\tEND IF;\n")
+	bodyBuf.WriteString("END;\n")
+	return true
 }

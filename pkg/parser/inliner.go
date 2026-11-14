@@ -6,6 +6,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"strconv"
 	"strings"
 )
 
@@ -87,6 +88,7 @@ func ResolveAndInline(proc *Procedure) (*ast.FuncDecl, error) {
 			Pkg:  proc.Pkg,
 			Info: proc.Info,
 			Fset: proc.Fset,
+			File: proc.File,
 		}
 	}
 
@@ -121,7 +123,7 @@ func ResolveAndInline(proc *Procedure) (*ast.FuncDecl, error) {
 		return nil, err
 	}
 
-	newStmts, err := eng.expandStmtList(ctx, proc.Func.Body.List, true, true)
+	newStmts, err := eng.expandStmtListWithBounds(ctx, proc.Func.Body.List, proc.Func.Body.Lbrace, proc.Func.Body.Rbrace, true, true)
 	if err != nil {
 		return nil, err
 	}
@@ -842,19 +844,19 @@ func (e *inlineEngine) classifyCall(ctx *expandCtx, call *ast.CallExpr) (*classi
 		return nil, fmt.Errorf("cannot transpile call to %s.%s (call chain: %s): function has no SQL mapping and cannot be inlined", pkgPath, fnObj.Name(), formatChain(ctx.callChain))
 	}
 
-	// Check if target is a standalone //gorm:procedure or an external BaseService procedure stub
-	if HasGormProcedureComment(targetInfo.Decl.Doc) {
+	// Check if target is a standalone //gorm:procedure, //gorm:proc, //gorm:func, or an external BaseService procedure stub
+	extName := ExtractExternalProcName(targetInfo.Decl.Doc)
+	if HasGormProcedureComment(targetInfo.Decl.Doc) || extName != "" {
 		return &classifiedCall{
 			kind:        callKindSubProc,
 			target:      targetInfo,
-			extProcName: ExtractExternalProcName(targetInfo.Decl.Doc),
+			extProcName: extName,
 		}, nil
 	}
 
 	if sig.Recv() != nil && embedsBaseService(sig.Recv().Type()) {
 		recvNamed := unwrapNamed(sig.Recv().Type())
-		extName := ExtractExternalProcName(targetInfo.Decl.Doc)
-		if extName != "" || (recvNamed != e.rootRecvNamed && !bodyContainsGormSQL(targetInfo.Decl.Body)) {
+		if recvNamed != e.rootRecvNamed && !bodyContainsGormSQL(targetInfo.Decl.Body) {
 			return &classifiedCall{
 				kind:        callKindSubProc,
 				target:      targetInfo,
@@ -1303,7 +1305,7 @@ func (e *inlineEngine) inlineCall(callerCtx *expandCtx, call *ast.CallExpr, cc *
 		preStmts = append(preStmts, makeVarDeclStmt(calleeCtx.retDoneIdent, &ast.Ident{Name: "bool"}, &ast.Ident{Name: "false"}))
 	}
 
-	bodyStmts, err := e.expandStmtList(calleeCtx, callee.Decl.Body.List, false, true)
+	bodyStmts, err := e.expandStmtListWithBounds(calleeCtx, callee.Decl.Body.List, callee.Decl.Body.Lbrace, callee.Decl.Body.Rbrace, false, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1311,11 +1313,65 @@ func (e *inlineEngine) inlineCall(callerCtx *expandCtx, call *ast.CallExpr, cc *
 	return append(preStmts, bodyStmts...), nil
 }
 
-func (e *inlineEngine) expandStmtList(ctx *expandCtx, stmts []ast.Stmt, isRoot bool, allowTail bool) ([]ast.Stmt, error) {
+func collectCommentsBetween(fset *token.FileSet, file *ast.File, startPos, endPos token.Pos, skipSameLine bool) []ast.Stmt {
+	if file == nil || !startPos.IsValid() || !endPos.IsValid() || startPos >= endPos {
+		return nil
+	}
+	startLine := 0
+	if skipSameLine && fset != nil {
+		startLine = fset.Position(startPos).Line
+	}
 	var out []ast.Stmt
+	for _, cg := range file.Comments {
+		if cg.Pos() > startPos && cg.End() < endPos {
+			if skipSameLine && fset != nil && fset.Position(cg.Pos()).Line == startLine {
+				continue
+			}
+			var lines []string
+			for _, c := range cg.List {
+				trimmed := strings.TrimSpace(c.Text)
+				if strings.HasPrefix(trimmed, "//gorm:") {
+					continue
+				}
+				lines = append(lines, c.Text)
+			}
+			if len(lines) == 0 {
+				continue
+			}
+			text := strings.Join(lines, "\n")
+			out = append(out, &ast.ExprStmt{
+				X: &ast.CallExpr{
+					Fun: &ast.Ident{Name: "__gormproc_comment__"},
+					Args: []ast.Expr{
+						&ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(text)},
+					},
+				},
+			})
+		}
+	}
+	return out
+}
+
+func (e *inlineEngine) expandStmtList(ctx *expandCtx, stmts []ast.Stmt, isRoot bool, allowTail bool) ([]ast.Stmt, error) {
+	return e.expandStmtListWithBounds(ctx, stmts, token.NoPos, token.NoPos, isRoot, allowTail)
+}
+
+func (e *inlineEngine) expandStmtListWithBounds(ctx *expandCtx, stmts []ast.Stmt, startPos, endPos token.Pos, isRoot bool, allowTail bool) ([]ast.Stmt, error) {
+	var out []ast.Stmt
+	var file *ast.File
+	var fset *token.FileSet
+	if ctx != nil && ctx.fn != nil {
+		file = ctx.fn.File
+		fset = ctx.fn.Fset
+	}
+	prevEnd := startPos
+	prevIsDecl := false
 
 	for i := 0; i < len(stmts); i++ {
 		stmt := stmts[i]
+		if prevEnd.IsValid() && stmt.Pos().IsValid() {
+			out = append(out, collectCommentsBetween(fset, file, prevEnd, stmt.Pos(), prevIsDecl)...)
+		}
 
 		expanded, inlinedErrAssign, err := e.expandStmt(ctx, stmt, isRoot, allowTail && i == len(stmts)-1)
 		if err != nil {
@@ -1328,14 +1384,17 @@ func (e *inlineEngine) expandStmtList(ctx *expandCtx, stmts []ast.Stmt, isRoot b
 		if inlinedErrAssign && i+1 < len(stmts) {
 			if nextIf, ok := stmts[i+1].(*ast.IfStmt); ok && nextIf.Init == nil && isBoilerplateErrIf(nextIf) {
 				i++
+				stmt = stmts[i]
 			}
 		}
 
+		prevEnd = stmt.End()
+		_, prevIsDecl = stmt.(*ast.DeclStmt)
 		out = append(out, expanded...)
 
 		// If ctx.useRetDone is active and `expanded` could set retDoneIdent, wrap remaining statements in `if !retDoneIdent { ... }`
 		if ctx.useRetDone && !isRoot && i < len(stmts)-1 && stmtMaySetRetDone(expanded, ctx.retDoneIdent) {
-			restExpanded, err := e.expandStmtList(ctx, stmts[i+1:], false, allowTail)
+			restExpanded, err := e.expandStmtListWithBounds(ctx, stmts[i+1:], prevEnd, endPos, false, allowTail)
 			if err != nil {
 				return nil, err
 			}
@@ -1348,8 +1407,12 @@ func (e *inlineEngine) expandStmtList(ctx *expandCtx, stmts []ast.Stmt, isRoot b
 					Body: &ast.BlockStmt{List: restExpanded},
 				})
 			}
-			break
+			return out, nil
 		}
+	}
+
+	if prevEnd.IsValid() && endPos.IsValid() {
+		out = append(out, collectCommentsBetween(fset, file, prevEnd, endPos, prevIsDecl)...)
 	}
 
 	return out, nil
@@ -1386,7 +1449,7 @@ func (e *inlineEngine) expandStmt(ctx *expandCtx, stmt ast.Stmt, isRoot bool, is
 
 	switch s := stmt.(type) {
 	case *ast.BlockStmt:
-		list, err := e.expandStmtList(ctx, s.List, isRoot, isTail)
+		list, err := e.expandStmtListWithBounds(ctx, s.List, s.Lbrace, s.Rbrace, isRoot, isTail)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1437,7 +1500,19 @@ func (e *inlineEngine) expandStmt(ctx *expandCtx, stmt ast.Stmt, isRoot bool, is
 					result = append(result, liftStmts...)
 					valExpr = liftedVal
 				}
-				result = append(result, makeVarDeclStmt(targetName, typExpr, valExpr))
+				declStmt := makeVarDeclStmt(targetName, typExpr, valExpr)
+				if ds, ok := declStmt.(*ast.DeclStmt); ok {
+					if declGen, ok := ds.Decl.(*ast.GenDecl); ok && len(declGen.Specs) == 1 {
+						if declVS, ok := declGen.Specs[0].(*ast.ValueSpec); ok {
+							declVS.Comment = vs.Comment
+							declVS.Doc = vs.Doc
+						}
+						if len(gen.Specs) == 1 {
+							declGen.Doc = gen.Doc
+						}
+					}
+				}
+				result = append(result, declStmt)
 			}
 		}
 		return result, false, nil
@@ -1676,7 +1751,7 @@ func (e *inlineEngine) expandStmt(ctx *expandCtx, stmt ast.Stmt, isRoot bool, is
 		}
 		preStmts = append(preStmts, liftCond...)
 
-		newBody, err := e.expandStmtList(ctx, s.Body.List, isRoot, false)
+		newBody, err := e.expandStmtListWithBounds(ctx, s.Body.List, s.Body.Lbrace, s.Body.Rbrace, isRoot, false)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1734,7 +1809,7 @@ func (e *inlineEngine) expandStmt(ctx *expandCtx, stmt ast.Stmt, isRoot bool, is
 			}
 		}
 
-		bodyList, err := e.expandStmtList(ctx, s.Body.List, isRoot, false)
+		bodyList, err := e.expandStmtListWithBounds(ctx, s.Body.List, s.Body.Lbrace, s.Body.Rbrace, isRoot, false)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1767,11 +1842,19 @@ func (e *inlineEngine) expandStmt(ctx *expandCtx, stmt ast.Stmt, isRoot bool, is
 			preStmts = append(preStmts, liftTag...)
 		}
 		var newCases []ast.Stmt
+		var file *ast.File
+		var fset *token.FileSet
+		if ctx != nil && ctx.fn != nil {
+			file = ctx.fn.File
+			fset = ctx.fn.Fset
+		}
+		prevCaseEnd := s.Body.Lbrace
 		for _, c := range s.Body.List {
 			cc, ok := c.(*ast.CaseClause)
 			if !ok {
 				continue
 			}
+			newCases = append(newCases, collectCommentsBetween(fset, file, prevCaseEnd, cc.Pos(), false)...)
 			var newList []ast.Expr
 			for _, ce := range cc.List {
 				rewCe, liftCe, err := e.rewriteAndLiftExpr(ctx, ce)
@@ -1781,10 +1864,12 @@ func (e *inlineEngine) expandStmt(ctx *expandCtx, stmt ast.Stmt, isRoot bool, is
 				preStmts = append(preStmts, liftCe...)
 				newList = append(newList, rewCe)
 			}
-			caseBody, err := e.expandStmtList(ctx, cc.Body, isRoot, false)
+			caseEnd := cc.End()
+			caseBody, err := e.expandStmtListWithBounds(ctx, cc.Body, cc.Colon, caseEnd, isRoot, false)
 			if err != nil {
 				return nil, false, err
 			}
+			prevCaseEnd = cc.End()
 			newCases = append(newCases, &ast.CaseClause{
 				List: newList,
 				Body: caseBody,
@@ -1943,7 +2028,7 @@ func (e *inlineEngine) expandTxCall(ctx *expandCtx, call *ast.CallExpr, isRoot b
 
 	// Expand statements inside the Transaction closure!
 	// Inside the Transaction closure, `return nil` at tail is a no-op if unwrapped, or preserved if kept inside Transaction.
-	innerList, err := e.expandStmtList(ctx, lit.Body.List, true, true)
+	innerList, err := e.expandStmtListWithBounds(ctx, lit.Body.List, lit.Body.Lbrace, lit.Body.Rbrace, true, true)
 	if err != nil {
 		return nil, false, err
 	}

@@ -450,3 +450,11 @@ func SelectInto(db *gorm.DB, query string, args ...interface{}) error {
 	outPtrs := args[numQs:]
 	return db.Raw(query, inArgs...).Row().Scan(outPtrs...)
 }
+
+// SignalError returns an error with a numeric SQL errno and message in Go,
+// and transpiles to SIGNAL SQLSTATE '45000' SET MYSQL_ERRNO = ..., MESSAGE_TEXT = ... in MySQL
+// or RAISE EXCEPTION '...' USING ERRCODE = '45000' in PostgreSQL.
+func SignalError(errno int64, msg string) error {
+	return fmt.Errorf("%d: %s", errno, msg)
+}
+
