@@ -271,17 +271,25 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 
 		typ := resolveSQLVarType(typeNode, valExpr, name, "mysql")
 
-		def := ""
-		if valExpr != nil {
-			if _, ok := valExpr.(*ast.BasicLit); ok {
-				def = " DEFAULT " + extractArg(valExpr)
-			} else if id, ok := valExpr.(*ast.Ident); ok && (id.Name == "true" || id.Name == "false") {
-				def = " DEFAULT " + strings.ToUpper(id.Name)
-			}
+		_, isPtr := typeNode.(*ast.StarExpr)
+		isAddr := false
+		if u, ok := valExpr.(*ast.UnaryExpr); ok && u.Op == token.AND {
+			isAddr = true
 		}
-		if def == "" {
-			if zeroVal := defaultZeroValueForSQLType(typ); zeroVal != "" {
-				def = " DEFAULT " + zeroVal
+
+		def := ""
+		if !isPtr && !isAddr {
+			if valExpr != nil {
+				if _, ok := valExpr.(*ast.BasicLit); ok {
+					def = " DEFAULT " + extractArg(valExpr)
+				} else if id, ok := valExpr.(*ast.Ident); ok && (id.Name == "true" || id.Name == "false") {
+					def = " DEFAULT " + strings.ToUpper(id.Name)
+				}
+			}
+			if def == "" {
+				if zeroVal := defaultZeroValueForSQLType(typ); zeroVal != "" {
+					def = " DEFAULT " + zeroVal
+				}
 			}
 		}
 		declsBuf.WriteString(fmt.Sprintf("DECLARE v_%s %s%s;%s\n", name, typ, def, varComments[name]))
@@ -323,7 +331,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 				if lit, ok := call.Args[0].(*ast.BasicLit); ok {
 					rawQuery := strings.Trim(lit.Value, "`\"")
 					isMultiline := strings.Contains(rawQuery, "\n")
-					query := rawQuery
+					query := normalizeQueryForMySQL(rawQuery)
 					if isMultiline {
 						query = dedentSQL(query)
 					}
@@ -345,6 +353,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		return false
 	}
 
+	hasSelectInto := false
 	emitSelectInto := func(call *ast.CallExpr) bool {
 		if len(call.Args) < 2 {
 			return false
@@ -355,7 +364,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		}
 		rawQuery := strings.Trim(queryLit.Value, "`\"")
 		isMultiline := strings.Contains(rawQuery, "\n")
-		query := rawQuery
+		query := normalizeQueryForMySQL(rawQuery)
 		if isMultiline {
 			query = dedentSQL(query)
 		} else {
@@ -390,6 +399,7 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		} else {
 			bodyBuf.WriteString(fmt.Sprintf("%s INTO %s %s;\n", selectPart, strings.Join(outs, ", "), fromPart))
 		}
+		hasSelectInto = true
 		return true
 	}
 
@@ -862,6 +872,9 @@ func ToMySQL(proc *parser.Procedure, hash string) (string, error) {
 		}
 	}
 
+	if hasTransaction || hasSelectInto {
+		declsBuf.WriteString("DECLARE CONTINUE HANDLER FOR NOT FOUND BEGIN END;\n")
+	}
 	if hasTransaction {
 		declsBuf.WriteString("DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK AND NO CHAIN; RESIGNAL; END;\n")
 	}

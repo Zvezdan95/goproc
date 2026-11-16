@@ -286,7 +286,18 @@ func JSONMergePreserve(json1, json2 string) string {
 	if err := json.Unmarshal([]byte(json2), &val2); err != nil {
 		return json1
 	}
-	merged := []interface{}{val1, val2}
+	arr1, ok1 := val1.([]interface{})
+	arr2, ok2 := val2.([]interface{})
+	var merged []interface{}
+	if ok1 && ok2 {
+		merged = append(arr1, arr2...)
+	} else if ok1 {
+		merged = append(arr1, val2)
+	} else if ok2 {
+		merged = append([]interface{}{val1}, arr2...)
+	} else {
+		merged = []interface{}{val1, val2}
+	}
 	b, _ := json.Marshal(merged)
 	return string(b)
 }

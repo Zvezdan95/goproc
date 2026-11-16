@@ -484,11 +484,11 @@ func PointerVarProc(ctx context.Context) error {
 	if err != nil {
 		t.Fatalf("ToMySQL failed: %v", err)
 	}
-	if !strings.Contains(myPointers, "DECLARE v_bAccID BIGINT DEFAULT 0;") {
-		t.Errorf("MySQL missing DECLARE v_bAccID BIGINT DEFAULT 0; for *uint32 pointer. Got:\n%s", myPointers)
+	if !strings.Contains(myPointers, "DECLARE v_bAccID BIGINT;") {
+		t.Errorf("MySQL missing DECLARE v_bAccID BIGINT; for *uint32 pointer. Got:\n%s", myPointers)
 	}
-	if !strings.Contains(myPointers, "DECLARE v_sMsg TEXT DEFAULT '';") {
-		t.Errorf("MySQL missing DECLARE v_sMsg TEXT DEFAULT ''; for *string pointer. Got:\n%s", myPointers)
+	if !strings.Contains(myPointers, "DECLARE v_sMsg TEXT;") {
+		t.Errorf("MySQL missing DECLARE v_sMsg TEXT; for *string pointer. Got:\n%s", myPointers)
 	}
 
 	// 12. Short variable declaration (:=) and struct pointer assignment (res.BonusAccountID = &bAccID)
@@ -523,8 +523,8 @@ func ShortDeclProc(ctx context.Context) (ResultStruct, error) {
 	if !strings.Contains(myShortDecl, "SET v_BonusAccountID = v_bAccID;") {
 		t.Errorf("MySQL missing SET v_BonusAccountID = v_bAccID;. Got:\n%s", myShortDecl)
 	}
-	if !strings.Contains(myShortDecl, "DECLARE v_BonusAccountID BIGINT DEFAULT 0;") {
-		t.Errorf("MySQL expected DECLARE v_BonusAccountID BIGINT DEFAULT 0; inferred from &bAccID. Got:\n%s", myShortDecl)
+	if !strings.Contains(myShortDecl, "DECLARE v_BonusAccountID BIGINT;") {
+		t.Errorf("MySQL expected DECLARE v_BonusAccountID BIGINT; inferred from &bAccID (pointer). Got:\n%s", myShortDecl)
 	}
 }
 
@@ -1014,6 +1014,12 @@ func (s *NormSvc) NormalizeProc(ctx context.Context, playerID int64, payload str
 	}
 	if !strings.Contains(mySQL, "FROM pokermem.tbl_account USE INDEX(idx_ACC_PLY_ACP) WHERE") {
 		t.Errorf("MySQL should preserve USE INDEX hint, got:\n%s", mySQL)
+	}
+	if !strings.Contains(mySQL, "DECLARE CONTINUE HANDLER FOR NOT FOUND BEGIN END;") {
+		t.Errorf("MySQL missing CONTINUE HANDLER FOR NOT FOUND for SelectInto, got:\n%s", mySQL)
+	}
+	if !strings.Contains(mySQL, "SELECT JSON_ARRAYAGG(id) INTO v_idsJSON FROM items WHERE player_id = p_playerID;") {
+		t.Errorf("MySQL should strip trailing ORDER BY on JSON_ARRAYAGG without GROUP BY, got:\n%s", mySQL)
 	}
 
 	pgSQL, err := ToPostgres(procs[0], "n1")

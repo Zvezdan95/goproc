@@ -152,3 +152,13 @@ func TestSelectIntoValidation(t *testing.T) {
 	// Insufficient arguments for query placeholders
 	// Cannot easily test full database without connection, but we verify param validation
 }
+
+func TestJSONMergePreserve(t *testing.T) {
+	if got := gormproc.JSONMergePreserve(`[]`, `[1]`); got != `[1]` {
+		t.Errorf("Expected [1], got %s", got)
+	}
+	if got := gormproc.JSONMergePreserve(`[1, 2]`, `[3, 4]`); got != `[1,2,3,4]` {
+		t.Errorf("Expected [1,2,3,4], got %s", got)
+	}
+}
+

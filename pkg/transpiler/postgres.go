@@ -272,17 +272,25 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 		typ := resolveSQLVarType(typeNode, valExpr, name, "postgres")
 		resVarTypes[name] = typ
 
-		def := ""
-		if valExpr != nil {
-			if _, ok := valExpr.(*ast.BasicLit); ok {
-				def = " := " + extractArg(valExpr)
-			} else if id, ok := valExpr.(*ast.Ident); ok && (id.Name == "true" || id.Name == "false") {
-				def = " := " + strings.ToUpper(id.Name)
-			}
+		_, isPtr := typeNode.(*ast.StarExpr)
+		isAddr := false
+		if u, ok := valExpr.(*ast.UnaryExpr); ok && u.Op == token.AND {
+			isAddr = true
 		}
-		if def == "" {
-			if zeroVal := defaultZeroValueForSQLType(typ); zeroVal != "" {
-				def = " := " + zeroVal
+
+		def := ""
+		if !isPtr && !isAddr {
+			if valExpr != nil {
+				if _, ok := valExpr.(*ast.BasicLit); ok {
+					def = " := " + extractArg(valExpr)
+				} else if id, ok := valExpr.(*ast.Ident); ok && (id.Name == "true" || id.Name == "false") {
+					def = " := " + strings.ToUpper(id.Name)
+				}
+			}
+			if def == "" {
+				if zeroVal := defaultZeroValueForSQLType(typ); zeroVal != "" {
+					def = " := " + zeroVal
+				}
 			}
 		}
 		varDecls.WriteString(fmt.Sprintf("\t%s %s%s;%s\n", "v_"+name, typ, def, varComments[name]))

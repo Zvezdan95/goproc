@@ -672,6 +672,56 @@ func rewriteJSONArrayAgg(s string) string {
 	return s[:aggIdx] + fmt.Sprintf("jsonb_agg(%s)::text", expr) + rewriteJSONArrayAgg(s[closeIdx+1:])
 }
 
+// normalizeQueryForMySQL strips trailing top-level ORDER BY clauses from JSON_ARRAYAGG queries
+// without GROUP BY to avoid MySQL 8.0 ONLY_FULL_GROUP_BY (Error 1140).
+func normalizeQueryForMySQL(query string) string {
+	if hasTopLevelKeyword(query, "JSON_ARRAYAGG", "") == -1 || hasTopLevelKeyword(query, "GROUP", "BY") != -1 {
+		return query
+	}
+	orderIdx := hasTopLevelKeyword(query, "ORDER", "BY")
+	if orderIdx == -1 {
+		return query
+	}
+	j := orderIdx + len("ORDER")
+	for j < len(query) && isSQLSpace(query[j]) {
+		j++
+	}
+	j += len("BY")
+	for j < len(query) && isSQLSpace(query[j]) {
+		j++
+	}
+	orderEnd := len(query)
+	upper := strings.ToUpper(query)
+	d := 0
+	for k := j; k < len(query); k++ {
+		c := query[k]
+		if c == '\'' || c == '"' || c == '`' {
+			k = skipQuotedSpan(query, k) - 1
+			continue
+		}
+		if c == '(' {
+			d++
+			continue
+		}
+		if c == ')' && d > 0 {
+			d--
+			continue
+		}
+		if d == 0 {
+			if c == ';' || matchKeywordAt(upper, k, "LIMIT") || matchKeywordAt(upper, k, "OFFSET") || matchKeywordAt(upper, k, "FETCH") || matchKeywordAt(upper, k, "FOR") {
+				orderEnd = k
+				break
+			}
+		}
+	}
+	beforeOrder := strings.TrimRight(query[:orderIdx], " \t\r\n")
+	afterOrder := strings.TrimLeft(query[orderEnd:], " \t")
+	if afterOrder != "" {
+		return beforeOrder + " " + afterOrder
+	}
+	return beforeOrder
+}
+
 func replaceFuncNameOutsideQuotes(s, oldFn, newFn string) string {
 	var b strings.Builder
 	inQuote := false
