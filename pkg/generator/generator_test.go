@@ -119,5 +119,37 @@ func MultiProc(ctx context.Context, id int64) (Res1, Res2, error) { return Res1{
 	if !strings.Contains(str, "return result1, result2, err") {
 		t.Errorf("Expected multi-result return missing. Got:\n%s", str)
 	}
+	if !strings.Contains(str, "gormproc.ScanRows(rows, &result1)") {
+		t.Errorf("Expected gormproc.ScanRows in Postgres multi-result branch. Got:\n%s", str)
+	}
+}
+
+func TestGenerateSingleStructResultCode(t *testing.T) {
+	code := `package test
+import "context"
+type Res1 struct { ID int64 ` + "`gorm:\"column:id\"`" + ` }
+func SingleProc(ctx context.Context, id int64) (Res1, error) { return Res1{}, nil }
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "test.go", code, 0)
+	if err != nil {
+		t.Fatalf("ParseFile failed: %v", err)
+	}
+	fn := file.Decls[len(file.Decls)-1].(*ast.FuncDecl)
+	proc := &coreParser.Procedure{
+		Name: "SingleProc",
+		Func: fn,
+		Pkg:  &packages.Package{Fset: fset},
+	}
+	src, err := GenerateCode("github.com/user/gormproc/example/procedures", []GeneratedProc{{
+		Proc: proc, Hash: "11223344", PgSQL: "SELECT 1;", MySQLSQL: "SELECT 1;",
+	}})
+	if err != nil {
+		t.Fatalf("GenerateCode failed: %v", err)
+	}
+	str := string(src)
+	if !strings.Contains(str, "gormproc.Scan(p.db.WithContext(ctx).Raw(\"SELECT * FROM singleproc_11223344(?)\", id), &result)") {
+		t.Errorf("Expected gormproc.Scan in Postgres single-struct branch. Got:\n%s", str)
+	}
 }
 

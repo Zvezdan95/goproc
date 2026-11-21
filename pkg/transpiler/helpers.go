@@ -278,6 +278,34 @@ func extractPostgresReturnColumns(proc *parser.Procedure, resFields []string, re
 	return nil
 }
 
+// extractReturnStructFieldTypes maps Go struct field names of a procedure's return struct
+// to their exact PostgreSQL column types, so local res.<Field> variables match RETURNS TABLE(...).
+func extractReturnStructFieldTypes(proc *parser.Procedure) map[string]string {
+	res := make(map[string]string)
+	if proc == nil || proc.Type == nil || proc.Type.Results() == nil {
+		return res
+	}
+	results := proc.Type.Results()
+	for i := 0; i < results.Len(); i++ {
+		t := results.At(i).Type()
+		if t.String() == "error" {
+			continue
+		}
+		unwrapped := t
+		if ptr, ok := unwrapped.(*types.Pointer); ok {
+			unwrapped = ptr.Elem()
+		}
+		if st, ok := unwrapped.Underlying().(*types.Struct); ok {
+			for fIdx := 0; fIdx < st.NumFields(); fIdx++ {
+				f := st.Field(fIdx)
+				res[f.Name()] = goTypeToPostgresSQL(f.Type())
+			}
+			return res
+		}
+	}
+	return res
+}
+
 func resolveSubProcCallName(proc *parser.Procedure, call *ast.CallExpr, defaultName string) string {
 	if ext := proc.ResolveCallName(call); ext != "" {
 		return ext
@@ -1016,7 +1044,7 @@ func inferTypeFromExpr(expr ast.Expr, varName string, dialect string) string {
 	strType := "VARCHAR(255)"
 	if dialect == "postgres" {
 		floatType = "NUMERIC"
-		strType = "VARCHAR"
+		strType = "TEXT"
 	}
 
 	if expr != nil {

@@ -260,6 +260,7 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 	}
 
 	varComments := make(map[string]string)
+	returnFieldTypes := extractReturnStructFieldTypes(proc)
 	declaredVars := make(map[string]bool)
 	resVarTypes := make(map[string]string)
 	declareVar := func(name string, typeNode ast.Expr, valExpr ast.Expr) {
@@ -270,6 +271,9 @@ func ToPostgres(proc *parser.Procedure, hash string) (string, error) {
 		localVarMap[name] = true
 
 		typ := resolveSQLVarType(typeNode, valExpr, name, "postgres")
+		if retTyp, ok := returnFieldTypes[name]; ok {
+			typ = retTyp
+		}
 		resVarTypes[name] = typ
 
 		_, isPtr := typeNode.(*ast.StarExpr)

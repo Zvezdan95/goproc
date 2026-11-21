@@ -143,7 +143,7 @@ func GenerateCode(pkgPath string, procs []GeneratedProc) ([]byte, error) {
 			resType := results[0]
 			buf.WriteString(fmt.Sprintf("\tvar result %s\n", resType))
 			buf.WriteString("\tif p.db != nil && p.db.Dialector != nil && p.db.Dialector.Name() == \"postgres\" {\n")
-			buf.WriteString(fmt.Sprintf("\t\terr := p.db.WithContext(ctx).Raw(%s).Scan(&result).Error\n", selectStmt))
+			buf.WriteString(fmt.Sprintf("\t\terr := gormproc.Scan(p.db.WithContext(ctx).Raw(%s), &result)\n", selectStmt))
 			buf.WriteString("\t\treturn result, err\n")
 			buf.WriteString("\t}\n")
 			buf.WriteString(fmt.Sprintf("\terr := p.db.WithContext(ctx).Raw(%s).Scan(&result).Error\n", callStmt))
@@ -159,10 +159,10 @@ func GenerateCode(pkgPath string, procs []GeneratedProc) ([]byte, error) {
 			buf.WriteString(fmt.Sprintf("\t\trows, err := p.db.WithContext(ctx).Raw(%s).Rows()\n", selectStmt))
 			buf.WriteString(fmt.Sprintf("\t\tif err != nil {\n\t\t\treturn %s, err\n\t\t}\n", strings.Join(varNames, ", ")))
 			buf.WriteString("\t\tdefer rows.Close()\n")
-			buf.WriteString(fmt.Sprintf("\t\terr = p.db.ScanRows(rows, &%s)\n", varNames[0]))
+			buf.WriteString(fmt.Sprintf("\t\terr = gormproc.ScanRows(rows, &%s)\n", varNames[0]))
 			for i := 1; i < len(varNames); i++ {
 				buf.WriteString("\t\tif rows.NextResultSet() {\n")
-				buf.WriteString(fmt.Sprintf("\t\t\t_ = p.db.ScanRows(rows, &%s)\n", varNames[i]))
+				buf.WriteString(fmt.Sprintf("\t\t\t_ = gormproc.ScanRows(rows, &%s)\n", varNames[i]))
 				buf.WriteString("\t\t}\n")
 			}
 			buf.WriteString(fmt.Sprintf("\t\treturn %s, err\n", strings.Join(varNames, ", ")))

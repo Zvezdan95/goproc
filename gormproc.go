@@ -1,6 +1,7 @@
 package gormproc
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -467,5 +468,352 @@ func SelectInto(db *gorm.DB, query string, args ...interface{}) error {
 // or RAISE EXCEPTION '...' USING ERRCODE = '45000' in PostgreSQL.
 func SignalError(errno int64, msg string) error {
 	return fmt.Errorf("%d: %s", errno, msg)
+}
+
+// Scan executes tx.Rows() and scans the result into dest with case-insensitive column-to-field
+// matching (checking both struct field names and gorm:"column:..." tags). This ensures PostgreSQL's
+// lowercase-folded RETURNS TABLE(...) column names map accurately to camelCase Go struct tags.
+func Scan(tx *gorm.DB, dest interface{}) error {
+	if tx == nil {
+		return errors.New("gormproc: db cannot be nil")
+	}
+	if tx.Error != nil {
+		return tx.Error
+	}
+	rows, err := tx.Rows()
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return ScanRows(rows, dest)
+}
+
+// ScanRows scans rows into dest (struct pointer, slice-of-struct pointer, or scalar pointer)
+// using case-insensitive matching against struct field names and gorm:"column:..." tags.
+func ScanRows(rows *sql.Rows, dest interface{}) error {
+	if rows == nil {
+		return errors.New("gormproc: rows cannot be nil")
+	}
+	rv := reflect.ValueOf(dest)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return errors.New("gormproc: Scan dest must be a non-nil pointer")
+	}
+	elem := rv.Elem()
+
+	if elem.Kind() == reflect.Slice {
+		elemType := elem.Type().Elem()
+		isPtrElem := elemType.Kind() == reflect.Ptr
+		structType := elemType
+		if isPtrElem {
+			structType = elemType.Elem()
+		}
+		if structType.Kind() != reflect.Struct {
+			for rows.Next() {
+				item := reflect.New(elemType)
+				if err := rows.Scan(&flexFieldScanner{val: item.Elem()}); err != nil {
+					return err
+				}
+				elem.Set(reflect.Append(elem, item.Elem()))
+			}
+			return rows.Err()
+		}
+		cols, err := rows.Columns()
+		if err != nil {
+			return err
+		}
+		fieldMap := buildCaseInsensitiveFieldMap(structType)
+		for rows.Next() {
+			rowVal := reflect.New(structType).Elem()
+			if err := scanRowIntoStruct(rows, cols, fieldMap, rowVal); err != nil {
+				return err
+			}
+			if isPtrElem {
+				ptr := reflect.New(structType)
+				ptr.Elem().Set(rowVal)
+				elem.Set(reflect.Append(elem, ptr))
+			} else {
+				elem.Set(reflect.Append(elem, rowVal))
+			}
+		}
+		return rows.Err()
+	}
+
+	if !rows.Next() {
+		return rows.Err()
+	}
+
+	if elem.Kind() == reflect.Ptr && elem.Type().Elem().Kind() == reflect.Struct {
+		if elem.IsNil() {
+			elem.Set(reflect.New(elem.Type().Elem()))
+		}
+		elem = elem.Elem()
+	}
+
+	if elem.Kind() == reflect.Struct {
+		cols, err := rows.Columns()
+		if err != nil {
+			return err
+		}
+		fieldMap := buildCaseInsensitiveFieldMap(elem.Type())
+		if err := scanRowIntoStruct(rows, cols, fieldMap, elem); err != nil {
+			return err
+		}
+		return rows.Err()
+	}
+
+	if err := rows.Scan(&flexFieldScanner{val: elem}); err != nil {
+		return err
+	}
+	return rows.Err()
+}
+
+func buildCaseInsensitiveFieldMap(t reflect.Type) map[string][]int {
+	m := make(map[string][]int)
+	var walk func(typ reflect.Type, prefix []int, overwrite bool)
+	walk = func(typ reflect.Type, prefix []int, overwrite bool) {
+		// First pass: map non-anonymous fields so outer struct fields take precedence over embedded fields.
+		for i := 0; i < typ.NumField(); i++ {
+			f := typ.Field(i)
+			if f.PkgPath != "" {
+				continue
+			}
+			gormTag := strings.TrimSpace(f.Tag.Get("gorm"))
+			if gormTag == "-" {
+				continue
+			}
+			if f.Anonymous {
+				ft := f.Type
+				if ft.Kind() == reflect.Ptr {
+					ft = ft.Elem()
+				}
+				if ft.Kind() == reflect.Struct {
+					continue
+				}
+			}
+			idx := append(append([]int(nil), prefix...), i)
+			nameKey := strings.ToLower(f.Name)
+			if overwrite || m[nameKey] == nil {
+				m[nameKey] = idx
+			}
+			if gormTag != "" {
+				for _, part := range strings.Split(gormTag, ";") {
+					if strings.HasPrefix(part, "column:") {
+						col := strings.TrimSpace(strings.TrimPrefix(part, "column:"))
+						if col != "" && col != "-" {
+							colKey := strings.ToLower(col)
+							if overwrite || m[colKey] == nil {
+								m[colKey] = idx
+							}
+						}
+					}
+				}
+			}
+		}
+		// Second pass: recurse into anonymous embedded structs without overwriting outer fields.
+		for i := 0; i < typ.NumField(); i++ {
+			f := typ.Field(i)
+			if !f.Anonymous {
+				continue
+			}
+			if strings.TrimSpace(f.Tag.Get("gorm")) == "-" {
+				continue
+			}
+			ft := f.Type
+			if ft.Kind() == reflect.Ptr {
+				if f.PkgPath != "" {
+					continue
+				}
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				idx := append(append([]int(nil), prefix...), i)
+				walk(ft, idx, false)
+			}
+		}
+	}
+	walk(t, nil, true)
+	return m
+}
+
+func fieldByIndexAlloc(v reflect.Value, idxPath []int) reflect.Value {
+	for i, x := range idxPath {
+		if i > 0 && v.Kind() == reflect.Ptr {
+			if v.IsNil() {
+				if !v.CanSet() {
+					return reflect.Value{}
+				}
+				v.Set(reflect.New(v.Type().Elem()))
+			}
+			v = v.Elem()
+		}
+		v = v.Field(x)
+	}
+	return v
+}
+
+func scanRowIntoStruct(rows *sql.Rows, cols []string, fieldMap map[string][]int, structVal reflect.Value) error {
+	targets := make([]interface{}, len(cols))
+	for i, col := range cols {
+		if idxPath, ok := fieldMap[strings.ToLower(col)]; ok {
+			fv := fieldByIndexAlloc(structVal, idxPath)
+			if fv.IsValid() && fv.CanSet() {
+				targets[i] = &flexFieldScanner{val: fv}
+				continue
+			}
+		}
+		var discard interface{}
+		targets[i] = &discard
+	}
+	return rows.Scan(targets...)
+}
+
+type flexFieldScanner struct {
+	val reflect.Value
+}
+
+func (s *flexFieldScanner) Scan(src interface{}) error {
+	if !s.val.CanSet() {
+		return nil
+	}
+	if src == nil {
+		s.val.Set(reflect.Zero(s.val.Type()))
+		return nil
+	}
+	if s.val.Kind() == reflect.Ptr {
+		elem := reflect.New(s.val.Type().Elem())
+		if err := assignSQLValue(elem.Elem(), src); err != nil {
+			return err
+		}
+		s.val.Set(elem)
+		return nil
+	}
+	return assignSQLValue(s.val, src)
+}
+
+func assignSQLValue(dst reflect.Value, src interface{}) error {
+	if dst.CanAddr() {
+		if scanner, ok := dst.Addr().Interface().(sql.Scanner); ok {
+			return scanner.Scan(src)
+		}
+	}
+	switch dst.Kind() {
+	case reflect.String:
+		switch v := src.(type) {
+		case string:
+			dst.SetString(v)
+		case []byte:
+			dst.SetString(string(v))
+		default:
+			dst.SetString(fmt.Sprint(v))
+		}
+		return nil
+	case reflect.Bool:
+		switch v := src.(type) {
+		case bool:
+			dst.SetBool(v)
+		case int64:
+			dst.SetBool(v != 0)
+		case []byte:
+			b, err := strconv.ParseBool(string(v))
+			if err != nil {
+				return err
+			}
+			dst.SetBool(b)
+		case string:
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return err
+			}
+			dst.SetBool(b)
+		default:
+			return fmt.Errorf("gormproc: cannot scan %T into bool", src)
+		}
+		return nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		switch v := src.(type) {
+		case int64:
+			dst.SetInt(v)
+		case uint64:
+			dst.SetInt(int64(v))
+		case float64:
+			dst.SetInt(int64(v))
+		case []byte:
+			n, err := strconv.ParseInt(string(v), 10, 64)
+			if err != nil {
+				return err
+			}
+			dst.SetInt(n)
+		case string:
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return err
+			}
+			dst.SetInt(n)
+		default:
+			return fmt.Errorf("gormproc: cannot scan %T into %s", src, dst.Type())
+		}
+		return nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		switch v := src.(type) {
+		case int64:
+			dst.SetUint(uint64(v))
+		case uint64:
+			dst.SetUint(v)
+		case float64:
+			dst.SetUint(uint64(v))
+		case []byte:
+			n, err := strconv.ParseUint(string(v), 10, 64)
+			if err != nil {
+				return err
+			}
+			dst.SetUint(n)
+		case string:
+			n, err := strconv.ParseUint(v, 10, 64)
+			if err != nil {
+				return err
+			}
+			dst.SetUint(n)
+		default:
+			return fmt.Errorf("gormproc: cannot scan %T into %s", src, dst.Type())
+		}
+		return nil
+	case reflect.Float32, reflect.Float64:
+		switch v := src.(type) {
+		case float64:
+			dst.SetFloat(v)
+		case float32:
+			dst.SetFloat(float64(v))
+		case int64:
+			dst.SetFloat(float64(v))
+		case uint64:
+			dst.SetFloat(float64(v))
+		case []byte:
+			f, err := strconv.ParseFloat(string(v), 64)
+			if err != nil {
+				return err
+			}
+			dst.SetFloat(f)
+		case string:
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return err
+			}
+			dst.SetFloat(f)
+		default:
+			return fmt.Errorf("gormproc: cannot scan %T into %s", src, dst.Type())
+		}
+		return nil
+	default:
+		sv := reflect.ValueOf(src)
+		if sv.Type().AssignableTo(dst.Type()) {
+			dst.Set(sv)
+			return nil
+		}
+		if sv.Type().ConvertibleTo(dst.Type()) {
+			dst.Set(sv.Convert(dst.Type()))
+			return nil
+		}
+		return fmt.Errorf("gormproc: cannot scan %T into %s", src, dst.Type())
+	}
 }
 

@@ -1041,6 +1041,53 @@ func (s *NormSvc) NormalizeProc(ctx context.Context, playerID int64, payload str
 	}
 }
 
+func TestPostgresReturnQueryTextTypeMatch(t *testing.T) {
+	src := `package testpkg
+
+import (
+	"context"
+	"github.com/user/gormproc"
+	"gorm.io/gorm"
+)
+
+type BookOut struct {
+	RoundID  uint32 ` + "`gorm:\"column:roundId\"`" + `
+	Currency string ` + "`gorm:\"column:currency\"`" + `
+}
+
+type BookSvc struct {
+	gormproc.BaseService
+	db *gorm.DB
+}
+
+//gorm:procedure
+func (s *BookSvc) GetBook(ctx context.Context, id int64) (BookOut, error) {
+	var res BookOut
+	cur := "EUR"
+	res.RoundID = uint32(id)
+	res.Currency = cur
+	return res, nil
+}
+`
+	procs, err := parser.ParseSource(map[string]string{"bookout.go": src})
+	if err != nil {
+		t.Fatalf("ParseSource failed: %v", err)
+	}
+	pgSQL, err := ToPostgres(procs[0], "b1")
+	if err != nil {
+		t.Fatalf("ToPostgres failed: %v", err)
+	}
+	if !strings.Contains(pgSQL, "RETURNS TABLE(RoundID BIGINT, Currency TEXT)") {
+		t.Errorf("Postgres expected RETURNS TABLE(RoundID BIGINT, Currency TEXT), got:\n%s", pgSQL)
+	}
+	if !strings.Contains(pgSQL, "v_Currency TEXT :=") {
+		t.Errorf("Postgres expected v_Currency TEXT (not VARCHAR) to match RETURNS TABLE, got:\n%s", pgSQL)
+	}
+	if strings.Contains(pgSQL, "v_Currency VARCHAR") {
+		t.Errorf("Postgres must not declare v_Currency as VARCHAR when RETURNS TABLE is TEXT, got:\n%s", pgSQL)
+	}
+}
+
 
 
 
